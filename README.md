@@ -14,17 +14,31 @@ Standard attention mechanisms are **memory-bound**, not compute-bound. The naive
 
 ---
 
+## 🏗️ System Architecture
+
+The diagram below shows the full project flow — from Python orchestration down to CUDA kernels executing on the GPU runtime, alongside the verification and benchmarking pipelines.
+
+![System Architecture](cuda-bootcamp/assets/architecture_diagram.png)
+
+**Three layers at a glance:**
+
+- **Python Orchestration** — `setup.py` builds the C++ extension; `run_benchmarks.py` drives timing experiments and writes the benchmark plot artifact.
+- **CUDA Extension** — Four kernels (`matmul.cu`, `matmul_tiled.cu`, `vector_add.cu`, `flash_attn_forward.cu`) are loaded as a PyTorch extension and execute on the CUDA runtime platform.
+- **Verification** — pytest suites (`test_matmul.py`, `online_softmax_test.py`, `test_flash_attn.py`) compare outputs against cuBLAS/PyTorch and PyTorch SDPA reference implementations.
+
+---
+
 ## 🔬 Key Architectural Features
 
 ### 🧠 SRAM Tiling & Memory Locality
 
-The kernel eliminates the O(N²) memory bottleneck by **never materializing the full attention matrix**. Instead, Q, K, and V tensors are partitioned into `BLOCK_SIZE × d` tiles and loaded into **shared memory (SRAM)**, which offers ~100× higher bandwidth than global HBM. Each thread block operates on a single Q tile, iterating over K/V tiles to compute attention scores and accumulate outputs entirely within the memory hierarchy's fast tier. This maximizes **arithmetic intensity** (FLOPs per byte transferred) and exploits **memory coalescing** for aligned global loads.
+The kernel eliminates the O(N²) memory bottleneck by **never materializing the full attention matrix**. Instead, Q, K, and V tensors are partitioned into `BLOCK_SIZE × d` tiles and loaded into **shared memory (SRAM)**, which offers ~100× higher bandwidth than global HBM. Each thread block operates on a single Q tile, iterating over K/V tiles to compute attention scores and accumulate outputs entirely within the memory hierarchy's fast tier.
 
 **Key insight:** By keeping working sets small (32×64 tiles = 8 KB), we fit comfortably within the 48 KB shared memory budget per SM, enabling full occupancy without spilling to L2 cache.
 
 ### ⚡ Online Softmax Integration
 
-Computing softmax over a tiled attention matrix requires a numerically stable algorithm that avoids materializing intermediate results. FlashAttention uses the **online softmax recurrence**, which maintains running statistics `(m_i, l_i)` — the max logit and sum of exponentials — and rescales the output accumulator `O_i` as new tiles arrive:
+FlashAttention uses the **online softmax recurrence**, maintaining running statistics `(m_i, l_i)` — the max logit and sum of exponentials — and rescaling the output accumulator `O_i` as new tiles arrive:
 
 ```
 m_new = max(m_i, max(S_tile))
@@ -33,35 +47,28 @@ O_i  *= exp(m_i − m_new)                          # rescale previous contribut
 O_i  += Σ_j exp(S_tile[j] − m_new) · V_tile[j]   # accumulate new weighted values
 ```
 
-A single normalization `O_i / l_i` at the end produces the exact attention output. This eliminates the need for separate softmax and matrix multiplication passes, fusing three kernels into one.
-
-**Mathematical guarantee:** The rescaling factors `exp(m_i − m_new)` ensure numerical equivalence to the standard two-pass softmax, with no approximation error.
+A single normalization `O_i / l_i` at the end produces the exact attention output, fusing three kernels into one with no approximation error.
 
 ### 🧩 4D Multi-Head Support
 
-Production transformers use 4D tensors shaped `[B, H, N, d]` (batch, heads, sequence, dimension). The kernel maps this to a **3D CUDA grid**:
+The kernel maps `[B, H, N, d]` tensors to a **3D CUDA grid**:
 
 ```cuda
 dim3 grid(N / BLOCK_SIZE,  H,  B);
-         └── sequence tiles  └── attention heads  └── batch samples
-
-// Each block computes pointer offset via strided arithmetic:
+// Each block computes its pointer offset via strided arithmetic:
 size_t slice_offset = (blockIdx.z * H + blockIdx.y) * N * d;
-const float* Q_slice = Q + slice_offset;
 ```
 
-This design achieves **perfect parallelism**: each `(batch, head)` pair is an independent attention computation with zero inter-block communication. The grid dimensions scale naturally to arbitrary batch sizes and head counts without kernel modifications.
+Each `(batch, head)` pair is an independent computation with zero inter-block communication, scaling naturally to arbitrary batch sizes and head counts.
 
 ### 🛡️ Two-Level Causal Masking
-
-Causal attention (used in autoregressive LLMs) requires masking future tokens. Naive element-wise masking wastes compute on tiles that contribute nothing. This implementation applies **hierarchical masking**:
 
 | **Level** | **Condition** | **Action** | **Benefit** |
 |-----------|---------------|------------|-------------|
 | **Tile-level** | `kv_tile_idx > q_tile_idx` | `break` — skip entire tile | Reduces work from O(N²) to **O(N²/2)** |
 | **Element-level** | `k_idx > q_idx` | `S_ij = -∞` | Handles diagonal tile boundaries |
 
-The tile-level skip is **warp-uniform** (all threads in a block share `blockIdx.x`), eliminating divergence penalties. For a 1024-token sequence with 32×32 tiles, this skips 528 of 1024 tile loads — a 51% reduction in memory traffic.
+The tile-level skip is warp-uniform, eliminating divergence penalties. For a 1024-token sequence with 32×32 tiles, this skips 528 of 1024 tile loads — a 51% reduction in memory traffic.
 
 ---
 
@@ -71,32 +78,27 @@ The tile-level skip is **warp-uniform** (all threads in a block share `blockIdx.
 
 ![Scaling Benchmark](cuda-bootcamp/assets/benchmark_seq_len.png)
 
-### Analysis
-
-The custom kernel maintains a **constant performance ratio** against PyTorch's SDPA across all sequence lengths, confirming correct O(N) memory scaling. At N=4096, both implementations exhibit quadratic time complexity (inherent to attention's O(N²) FLOPs), but the custom kernel's memory footprint remains linear. The slight overhead versus SDPA stems from PyTorch's use of Tensor Cores (mixed-precision WMMA instructions) and additional low-level optimizations like software pipelining, which are beyond the scope of this educational implementation.
-
-**Key takeaway:** This kernel proves the algorithmic correctness of FlashAttention's tiling strategy. Production deployments would add Tensor Core support and backward pass implementation for full training capability.
+The custom kernel maintains a **constant performance ratio** against PyTorch's SDPA across all sequence lengths, confirming correct O(N) memory scaling. The slight overhead versus SDPA stems from PyTorch's use of Tensor Cores (mixed-precision WMMA instructions) and software pipelining — optimizations beyond the scope of this educational implementation.
 
 ---
 
 ## 🔍 Hardware Profiling & V2 Roadmap
 
-To understand the performance gap between this custom implementation and PyTorch's native SDPA, the kernel was profiled using NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revealed that the kernel is severely memory-bound, leaving the compute units underutilized.
+Profiled with NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revealed the kernel is severely memory-bound:
 
-**Raw Metrics:**
-- Compute (SM) Throughput: ~8.5%
-- Memory Throughput: ~36.0%
+| Metric | Value |
+|--------|-------|
+| Compute (SM) Throughput | ~8.5% |
+| Memory Throughput | ~36.0% |
 
-### Identified Bottlenecks (The "Why")
+**Identified bottlenecks:**
+- **Uncoalesced global memory access** — threads utilize only 4 of 32 bytes per sector per transaction.
+- **Shared memory bank conflicts** — 32-way conflicts on ~96% of store wavefronts, forcing serialized accesses.
 
-- **Uncoalesced Global Memory Access:** The profiler indicated that threads are only utilizing 4 bytes out of the 32-byte sector per global memory transaction. This inefficiency drops memory throughput significantly.
-- **Shared Memory Bank Conflicts:** The profiler flagged a severe 32-way bank conflict on shared memory stores, affecting ~96% of store wavefronts. This forces the GPU to serialize memory accesses.
-
-### V2 Optimization Roadmap (Next Steps)
-
-- Implement vectorized memory reads (e.g., `float4`) to coalesce global memory access and maximize bandwidth.
-- Add padding to the shared memory allocation tiles to break the 32-way stride and eliminate bank conflicts.
-- Replace standard CUDA cores with Tensor Cores (`mma.sync`) for the heavy matrix multiplication blocks.
+**V2 Roadmap:**
+- Vectorized reads (`float4`) to coalesce global memory access.
+- Shared memory padding to eliminate 32-way bank conflicts.
+- Tensor Core support (`mma.sync`) for the matrix multiplication blocks.
 
 ---
 
@@ -117,6 +119,7 @@ flashattention_cuda_kernel/
 │   ├── benchmarks/
 │   │   └── run_benchmarks.py        # Sequence-length scaling benchmark + plot generation
 │   ├── assets/
+│   │   ├── architecture_diagram.png # System architecture & data flow
 │   │   └── benchmark_seq_len.png    # Performance visualization
 │   └── setup.py                     # PyTorch C++ extension build configuration
 └── README.md
@@ -142,7 +145,7 @@ pip install -e .
 python tests/test_flash_attn.py
 ```
 
-**Expected Output:**
+**Expected output:**
 ```
 Shape: Q/K/V = [2, 4, 1024, 64]  |  iterations = 20
 Max abs diff vs causal SDPA reference: 0.000XXX
@@ -173,15 +176,10 @@ python benchmarks/run_benchmarks.py
 
 ---
 
-## 📚 References & Acknowledgments
+## 📚 References
 
-This implementation is based on the groundbreaking work:
-
-- **Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C.** (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
-
+- **Dao et al.** (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
 - **Dao, T.** (2023). *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.* ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
-
-Special thanks to the CUDA programming community and PyTorch team for their excellent documentation and tooling.
 
 ---
 
