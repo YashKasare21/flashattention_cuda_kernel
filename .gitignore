@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# CUDA build artifacts
+*.so
+*.o
+*.ptx
+
+# Jupyter
+.ipynb_checkpoints/
