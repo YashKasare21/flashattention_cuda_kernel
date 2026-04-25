@@ -6,7 +6,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name='custom_flash_attn',
-            sources=['flash_attn_forward.cu'],
+            sources=['src/flash_attn_forward.cu'],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': ['-O3', '--use_fast_math', '-lineinfo'],
