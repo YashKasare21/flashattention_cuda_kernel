@@ -8,7 +8,8 @@
 //   blockIdx.x → Q tile within sequence
 //   blockIdx.y → head index
 //   blockIdx.z → batch index
-// Each thread block owns one (batch, head, Q-tile) and sweeps all KV tiles.
+// Each thread block owns one (batch, head, Q-tile) and sweeps KV tiles up to
+// and including its own tile (causal mask skips all future tiles entirely).
 __global__ void flash_attn_forward_kernel(
     const float* __restrict__ Q,   // [B, H, N, d]
     const float* __restrict__ K,
@@ -23,10 +24,10 @@ __global__ void flash_attn_forward_kernel(
     const int tx = threadIdx.x;
 
     // Decode 3D grid position
-    const int batch_idx = blockIdx.z;
-    const int head_idx  = blockIdx.y;
-    const int q_tile    = blockIdx.x;
-    const int q_row     = q_tile * BLOCK_SIZE + tx;   // local sequence row
+    const int batch_idx    = blockIdx.z;
+    const int head_idx     = blockIdx.y;
+    const int q_tile_idx   = blockIdx.x;                      // Q tile index
+    const int global_q_idx = q_tile_idx * BLOCK_SIZE + tx;    // global sequence row
 
     // Base pointer offset for this (batch, head) slice: [B, H, N, d] row-major
     const int slice_offset = (batch_idx * H + head_idx) * N * D_DIM;
@@ -46,10 +47,10 @@ __global__ void flash_attn_forward_kernel(
     for (int k = 0; k < D_DIM; ++k) O_i[k] = 0.0f;
 
     // ── Load Q tile for this block (once) ────────────────────────────────────
-    if (q_row < N) {
+    if (global_q_idx < N) {
         #pragma unroll
         for (int k = 0; k < D_DIM; ++k)
-            s_Q[tx][k] = Q_slice[q_row * D_DIM + k];
+            s_Q[tx][k] = Q_slice[global_q_idx * D_DIM + k];
     } else {
         #pragma unroll
         for (int k = 0; k < D_DIM; ++k)
@@ -61,6 +62,10 @@ __global__ void flash_attn_forward_kernel(
     const int num_kv_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     for (int kv_tile = 0; kv_tile < num_kv_blocks; ++kv_tile) {
+        // Causal mask: skip entire tiles whose keys all come after this query.
+        // q_tile_idx is uniform across the block → no warp divergence.
+        if (kv_tile > q_tile_idx) break;
+
         const int kv_row = kv_tile * BLOCK_SIZE + tx;
 
         if (kv_row < N) {
@@ -78,7 +83,7 @@ __global__ void flash_attn_forward_kernel(
         }
         __syncthreads();
 
-        // S_ij = s_Q[tx] · s_K[jj]^T * scale
+        // S_ij = s_Q[tx] · s_K[jj]^T * scale; apply causal mask per element
         float S_ij[BLOCK_SIZE];
         float m_j = -FLT_MAX;
         #pragma unroll
@@ -88,6 +93,11 @@ __global__ void flash_attn_forward_kernel(
             for (int k = 0; k < D_DIM; ++k)
                 dot += s_Q[tx][k] * s_K[jj][k];
             S_ij[jj] = dot * scale;
+
+            // Mask out keys that come after the current query position
+            int global_k_idx = kv_tile * BLOCK_SIZE + jj;
+            if (global_k_idx > global_q_idx) S_ij[jj] = -1e20f;
+
             if (S_ij[jj] > m_j) m_j = S_ij[jj];
         }
 
@@ -123,10 +133,10 @@ __global__ void flash_attn_forward_kernel(
     }
 
     // Normalize and write output
-    if (q_row < N) {
+    if (global_q_idx < N) {
         #pragma unroll
         for (int k = 0; k < D_DIM; ++k)
-            O_slice[q_row * D_DIM + k] = O_i[k] / l_i;
+            O_slice[global_q_idx * D_DIM + k] = O_i[k] / l_i;
     }
 }
 
