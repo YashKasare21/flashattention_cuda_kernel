@@ -79,6 +79,27 @@ The custom kernel maintains a **constant performance ratio** against PyTorch's S
 
 ---
 
+## 🔍 Hardware Profiling & V2 Roadmap
+
+To understand the performance gap between this custom implementation and PyTorch's native SDPA, the kernel was profiled using NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revealed that the kernel is severely memory-bound, leaving the compute units underutilized.
+
+**Raw Metrics:**
+- Compute (SM) Throughput: ~8.5%
+- Memory Throughput: ~36.0%
+
+### Identified Bottlenecks (The "Why")
+
+- **Uncoalesced Global Memory Access:** The profiler indicated that threads are only utilizing 4 bytes out of the 32-byte sector per global memory transaction. This inefficiency drops memory throughput significantly.
+- **Shared Memory Bank Conflicts:** The profiler flagged a severe 32-way bank conflict on shared memory stores, affecting ~96% of store wavefronts. This forces the GPU to serialize memory accesses.
+
+### V2 Optimization Roadmap (Next Steps)
+
+- Implement vectorized memory reads (e.g., `float4`) to coalesce global memory access and maximize bandwidth.
+- Add padding to the shared memory allocation tiles to break the 32-way stride and eliminate bank conflicts.
+- Replace standard CUDA cores with Tensor Cores (`mma.sync`) for the heavy matrix multiplication blocks.
+
+---
+
 ## 📁 Project Structure
 
 ```
