@@ -16,3 +16,10 @@ build/
 # Jupyter
 .ipynb_checkpoints/
 venv/
+
+# Archives
+*.zip
+
+# Stale legacy scripts (superseded by restructured layout)
+cuda-bootcamp/benchmarks/benchmark.py
+cuda-bootcamp/tests/test.py

@@ -65,16 +65,23 @@ The tile-level skip reduces the inner loop from O(N²) to **O(N²/2)** work. The
 ## Repository Structure
 
 ```
-cuda-bootcamp/
-├── src/
-│   └── flash_attn_forward.cu   # Main CUDA kernel
-├── tests/
-│   └── test_flash_attn.py      # Correctness + timing vs PyTorch SDPA
-├── benchmarks/
-│   └── run_benchmarks.py       # Scaling benchmark across sequence lengths
-├── assets/
-│   └── benchmark_seq_len.png   # Generated benchmark plot
-└── setup.py
+flashattention_cuda_kernel/
+├── cuda-bootcamp/
+│   ├── src/
+│   │   ├── flash_attn_forward.cu    # FlashAttention forward kernel (main)
+│   │   ├── matmul.cu                # Naive matrix multiplication
+│   │   ├── matmul_tiled.cu          # Tiled shared-memory matrix multiplication
+│   │   └── vector_add.cu            # CUDA warm-up: vector addition
+│   ├── tests/
+│   │   ├── test_flash_attn.py       # Correctness + timing vs PyTorch SDPA
+│   │   ├── test_matmul.py           # Naive vs tiled vs cuBLAS benchmark
+│   │   └── online_softmax_test.py   # Online softmax math proof-of-concept
+│   ├── benchmarks/
+│   │   └── run_benchmarks.py        # Seq-len scaling benchmark + plot
+│   ├── assets/
+│   │   └── benchmark_seq_len.png    # Generated benchmark plot
+│   └── setup.py
+└── README.md
 ```
 
 ---
@@ -83,7 +90,7 @@ cuda-bootcamp/
 
 Benchmark: `B=2, H=4, d=64`, sequence lengths 256 → 4096, causal attention, 30 iterations.
 
-![Benchmark](assets/benchmark_seq_len.png)
+![Benchmark](cuda-bootcamp/assets/benchmark_seq_len.png)
 
 ---
 
@@ -92,13 +99,15 @@ Benchmark: `B=2, H=4, d=64`, sequence lengths 256 → 4096, causal attention, 30
 ### Install
 
 ```bash
-# From the cuda-bootcamp/ directory
+git clone https://github.com/YashKasare21/flashattention_cuda_kernel.git
+cd flashattention_cuda_kernel/cuda-bootcamp
 pip install -e . --no-build-isolation
 ```
 
 ### Run Tests
 
 ```bash
+cd cuda-bootcamp
 python tests/test_flash_attn.py
 ```
 
@@ -116,8 +125,9 @@ Speedup (Custom/SDPA):    X.XXx
 ### Run Benchmarks
 
 ```bash
+cd cuda-bootcamp
 python benchmarks/run_benchmarks.py
-# Plot saved to assets/benchmark_seq_len.png
+# Plot saved to cuda-bootcamp/assets/benchmark_seq_len.png
 ```
 
 ---
