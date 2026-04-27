@@ -42,15 +42,17 @@ __global__ void flash_attn_v2_kernel(
     for (int k = 0; k < D_DIM; ++k) O_i[k] = 0.0f;
 
     // ── Load Q tile ───────────────────────────────────────────────────────────
-    // PERF CHANGE 1: float4 vectorized loads. D_DIM=64, 64/4=16 float4 per row.
-    // Each thread issues 16 wide 128-bit loads instead of 64 scalar 32-bit loads,
-    // cutting load-instruction count 4x and maximising memory-bus utilisation.
+    // Use __ldg for read-only cache loads — no 16-byte alignment requirement,
+    // bypasses L1, reduces pressure on the main memory path.
     if (global_q_idx < N) {
-        const float4* Q4 = reinterpret_cast<const float4*>(Q_slice + global_q_idx * D_DIM);
-        float4* sQ4      = reinterpret_cast<float4*>(s_Q[tx]);
+        const float* src = Q_slice + global_q_idx * D_DIM;
         #pragma unroll
-        for (int k = 0; k < D_DIM / 4; ++k)
-            sQ4[k] = Q4[k];
+        for (int k = 0; k < D_DIM; k += 4) {
+            s_Q[tx][k]   = __ldg(src + k);
+            s_Q[tx][k+1] = __ldg(src + k + 1);
+            s_Q[tx][k+2] = __ldg(src + k + 2);
+            s_Q[tx][k+3] = __ldg(src + k + 3);
+        }
     } else {
         #pragma unroll
         for (int k = 0; k < D_DIM; ++k) s_Q[tx][k] = 0.0f;
@@ -64,16 +66,19 @@ __global__ void flash_attn_v2_kernel(
 
         const int kv_row = kv_tile * BLOCK_SIZE + tx;
 
-        // PERF CHANGE 1 (cont.): same float4 load pattern for K and V tiles.
         if (kv_row < N) {
-            const float4* K4 = reinterpret_cast<const float4*>(K_slice + kv_row * D_DIM);
-            const float4* V4 = reinterpret_cast<const float4*>(V_slice + kv_row * D_DIM);
-            float4* sK4      = reinterpret_cast<float4*>(s_K[tx]);
-            float4* sV4      = reinterpret_cast<float4*>(s_V[tx]);
+            const float* ksrc = K_slice + kv_row * D_DIM;
+            const float* vsrc = V_slice + kv_row * D_DIM;
             #pragma unroll
-            for (int k = 0; k < D_DIM / 4; ++k) {
-                sK4[k] = K4[k];
-                sV4[k] = V4[k];
+            for (int k = 0; k < D_DIM; k += 4) {
+                s_K[tx][k]   = __ldg(ksrc + k);
+                s_K[tx][k+1] = __ldg(ksrc + k + 1);
+                s_K[tx][k+2] = __ldg(ksrc + k + 2);
+                s_K[tx][k+3] = __ldg(ksrc + k + 3);
+                s_V[tx][k]   = __ldg(vsrc + k);
+                s_V[tx][k+1] = __ldg(vsrc + k + 1);
+                s_V[tx][k+2] = __ldg(vsrc + k + 2);
+                s_V[tx][k+3] = __ldg(vsrc + k + 3);
             }
         } else {
             #pragma unroll
@@ -141,6 +146,7 @@ torch::Tensor flash_attn_v2_forward(torch::Tensor Q, torch::Tensor K, torch::Ten
     TORCH_CHECK(Q.is_cuda(),  "Q must be a CUDA tensor");
     TORCH_CHECK(Q.dtype() == torch::kFloat32, "Q must be float32");
     TORCH_CHECK(Q.dim() == 4, "Q must be 4D: [B, H, N, d]");
+    TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous — non-contiguous tensors can cause misaligned loads");
 
     const int B = Q.size(0);
     const int H = Q.size(1);
