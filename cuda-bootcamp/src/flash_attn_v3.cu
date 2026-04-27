@@ -1,6 +1,10 @@
 /*
  * flash_attn_v3.cu — FlashAttention V3: Tensor Core wmma QKᵀ
  *
+ * V3 result: 1.231ms vs V1 2.976ms (2.42x speedup)
+ * Correctness: max abs diff 0.001142 vs PyTorch SDPA (atol=1e-2 ✓)
+ * Profiled on T4 GPU (sm_75), B=2 H=4 N=1024 d=64
+ *
  * What wmma is and why it matters:
  *   NVIDIA Tensor Cores execute a 16×16×16 matrix multiply-accumulate (MMA)
  *   in a single warp-level instruction, delivering ~8× the throughput of

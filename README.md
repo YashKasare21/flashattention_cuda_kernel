@@ -98,28 +98,28 @@ Profiled with NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revea
 **V2 Roadmap:**
 - ✅ Vectorized reads (`__ldg` gather) to route loads through the read-only texture cache.
 - ✅ Shared memory padding (`+1` column) to eliminate 32-way bank conflicts.
-- Tensor Core support (`mma.sync`) for the matrix multiplication blocks.
+- ✅ Tensor Core support (`wmma` API, 16×16×16 fp16 tiles) for the QKᵀ matrix multiply.
+- **V3 Remaining Gap** — V3 is still ~3× slower than PyTorch SDPA. The residual gap is due to software pipelining (async memory prefetch overlapping compute) and multi-warp occupancy tuning; closing it would require a full kernel redesign beyond the scope of this project.
 
 ---
 
-## 📈 V2 Optimization Results
+## 📈 Optimization Progression
 
-**V1 vs V2 Nsight Comparison** (T4 GPU, B=2 H=4 N=1024 d=64):
+**V1 → V2 → V3 vs PyTorch SDPA** (T4 GPU, B=2 H=4 N=1024 d=64):
 
-| Metric | V1 Baseline | V2 Optimized | Delta |
-|---------------------------|-------------|--------------|------------|
-| Execution time | 4.107 ms | 1.728 ms | 2.38x faster |
-| SM Throughput (SOL) | ~8.5% | ~12% | +41% |
-| SMEM bank conflicts (ld) | 1,892,551 | ~500 | -99.97% |
-| SMEM bank conflicts (st) | 16,896,946 | ~8,700 | -99.95% |
-| vs PyTorch SDPA | 10.5x slower | 10.5x slower | same gap |
+| Version | Time (ms) | Speedup vs V1 | Key Technique | SM SOL |
+|---------|-----------|---------------|-------------------------------|--------|
+| V1 | 2.976 ms | 1.00× | Baseline scalar FMAs | ~8.5% |
+| V2 | 2.038 ms | 1.46× | `__ldg` + SMEM padding | ~12% |
+| V3 | 1.231 ms | 2.42× | wmma Tensor Core (fp16 QKᵀ) | TBD |
+| SDPA | 0.401 ms | 7.43× | PyTorch optimized | — |
 
 The two V2 changes each targeted a distinct bottleneck identified by Nsight Compute:
 
 - **SMEM padding (+1 column)** shifts each row by one float, spreading consecutive-thread accesses across all 32 banks and eliminating the 32-way conflicts that were serializing ~96% of shared memory store wavefronts — the dominant source of stall cycles in V1.
 - **`__ldg` loads** route global memory reads through the read-only texture cache rather than L1, reducing cache pressure and avoiding the strict 16-byte alignment requirement that caused `cudaErrorMisalignedAddress` with the original `float4` cast approach.
-- The **remaining gap vs PyTorch SDPA** is structural: SDPA uses Tensor Core WMMA instructions (`mma.sync`) that execute 16×16×16 matrix fragments in a single warp-level operation, delivering ~8× the FMA throughput of scalar code on the same hardware.
-- **V3 roadmap:** adopt the `wmma` API (16×16×16 tiles) for the QKᵀ and PV accumulation steps to close the compute gap against SDPA.
+- **V3 wmma** uses the `nvcuda::wmma` API to execute 16×16×16 matrix fragments on Tensor Core hardware, delivering ~8× the FMA throughput of scalar code. Q/K tiles are cast to fp16; the accumulator and V/O remain fp32.
+- The **remaining gap vs PyTorch SDPA** is structural: SDPA uses software pipelining (`cp.async` prefetch overlapping compute) and multi-warp occupancy tuning that would require a full kernel redesign to replicate.
 
 ---
 
