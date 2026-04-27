@@ -44,13 +44,24 @@ __global__ void flash_attn_v3_kernel(
     float* __restrict__ O,
     const int N, const int H
 ) {
-    // s_Q / s_K in fp16 — wmma matrix_a/b require __half inputs
-    // s_V in fp32 — accumulation stays in full precision
-    // s_S in fp32 — wmma accumulator output, read per-thread for softmax
-    __shared__ __half s_Q[BLOCK_SIZE][D_DIM + 1];
-    __shared__ __half s_K[BLOCK_SIZE][D_DIM + 1];
+    // wmma::load_matrix_sync requires shared memory pointers to be 32-byte
+    // (256-bit) aligned at each 16-row sub-tile boundary.
+    // __half s_Q/s_K: D_DIM=64 halfs × 2 bytes = 128 bytes per row — already
+    //   a multiple of 32, so NO padding is needed (adding +1 would break it).
+    // float s_V: keep +1 bank-conflict padding (floats don't need wmma alignment).
+    // float s_S: __align__(32) ensures the base pointer satisfies wmma store.
+    __shared__ __half s_Q[BLOCK_SIZE][D_DIM];
+    __shared__ __half s_K[BLOCK_SIZE][D_DIM];
     __shared__ float  s_V[BLOCK_SIZE][D_DIM + 1];
-    __shared__ float  s_S[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __align__(32) float s_S[BLOCK_SIZE][BLOCK_SIZE];
+
+    #ifdef DEBUG_ALIGN
+    if (threadIdx.x == 0) {
+        assert(((uintptr_t)s_Q % 32) == 0);
+        assert(((uintptr_t)s_K % 32) == 0);
+        assert(((uintptr_t)s_S % 32) == 0);
+    }
+    #endif
 
     const int tx = threadIdx.x;
 
@@ -137,12 +148,11 @@ __global__ void flash_attn_v3_kernel(
 
         for (int k = 0; k < D_DIM; k += 16) {
             for (int i = 0; i < 2; i++) {
-                // row stride of s_Q is D_DIM+1 __half elements
-                load_matrix_sync(frag_Q, &s_Q[i * 16][k], D_DIM + 1);
+                // row stride = D_DIM (no padding on __half arrays)
+                load_matrix_sync(frag_Q, &s_Q[i * 16][k], D_DIM);
                 for (int j = 0; j < 2; j++) {
-                    // col_major: K tile is K[j*16 .. j*16+15, k .. k+15]
-                    // stored row-major in s_K, so col_major load transposes it
-                    load_matrix_sync(frag_K, &s_K[j * 16][k], D_DIM + 1);
+                    // col_major load transposes s_K in-place
+                    load_matrix_sync(frag_K, &s_K[j * 16][k], D_DIM);
                     mma_sync(frag_S[i][j], frag_Q, frag_K, frag_S[i][j]);
                 }
             }
