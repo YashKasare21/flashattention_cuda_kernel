@@ -111,8 +111,22 @@ Profiled with NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revea
 |---------|-----------|---------------|-------------------------------|--------|
 | V1 | 2.976 ms | 1.00× | Baseline scalar FMAs | ~8.5% |
 | V2 | 2.038 ms | 1.46× | `__ldg` + SMEM padding | ~12% |
-| V3 | 1.231 ms | 2.42× | wmma Tensor Core (fp16 QKᵀ) | TBD |
+| V3 | 1.231 ms | 2.42× | wmma Tensor Core (fp16 QKᵀ) | ~8.5%* |
 | SDPA | 0.401 ms | 7.43× | PyTorch optimized | — |
+
+> *V3 SM throughput reads ~8.5% because Nsight's `sm__throughput` metric tracks scalar CUDA cores only. Tensor Core (wmma) execution runs on a separate hardware unit not captured by this counter — the 2.42× speedup over V1 confirms the Tensor Cores are active.
+
+### Hardware Profiling Detail
+
+| Metric | V1 Baseline | V2 Optimized | V3 Tensor Core |
+|-------------------------|-------------|--------------|----------------|
+| SM Throughput (SOL) | ~8.5% | ~12% | ~8.5%* |
+| SMEM bank conflicts (ld) | 1,892,551 | ~500 | ~947,000 |
+| SMEM bank conflicts (st) | 16,896,946 | ~8,700 | ~2,593,197 |
+| Global mem load % | ~0.86% | ~1.16% | ~1.40% |
+| Execution time | 2.976 ms | 2.038 ms | 1.231 ms |
+
+V2's near-zero bank conflicts came from the `+1` column padding on `s_Q`/`s_K`, which shifted each row by one float and spread accesses across all 32 banks. V3 had to remove that padding from the `__half` arrays to satisfy `wmma::load_matrix_sync`'s 32-byte alignment requirement — partially reintroducing conflicts (~947K load, ~2.6M store). This is a documented hardware tradeoff: alignment for Tensor Core access vs bank conflict avoidance. The Tensor Core gain wins decisively at 1.66× over V2 despite the regression. The remaining 3× gap to SDPA is explained by software pipelining (`cp.async` prefetch overlapping compute) and multi-warp occupancy tuning — neither is addressable within a single-warp-per-block kernel design.
 
 The two V2 changes each targeted a distinct bottleneck identified by Nsight Compute:
 
