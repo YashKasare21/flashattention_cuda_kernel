@@ -27,6 +27,11 @@ setup(
                 'nvcc': ['-O3', '--use_fast_math', '-lineinfo', '-arch=sm_75'],
             },
         ),
+        CUDAExtension(
+            name='custom_flash_attn_backward',
+            sources=['src/flash_attn_backward.cu'],
+            extra_compile_args=_flags,
+        ),
     ],
     cmdclass={'build_ext': BuildExtension},
 )
