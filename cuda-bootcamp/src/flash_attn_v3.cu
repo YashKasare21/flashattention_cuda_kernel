@@ -33,8 +33,7 @@
  * Shared memory budget per block (48KB limit on T4):
  *   D=64:  s_Q(4KB) + s_K(4KB) + s_V(8KB) + s_S(4KB) = ~20KB  ✓ wmma
  *   D=128: s_Q(8KB) + s_K(8KB) + s_V(16KB) + s_S(4KB) = ~36KB ✓ wmma
- *   D=256: s_Q(16KB) + s_K(16KB) + s_V(32KB) + s_S(4KB) = ~68KB ✗
- *          D=256 falls back to a scalar kernel to stay within limits.
+ *   D=256: s_Q(16KB) + s_K(16KB) + s_V(32KB) + s_S(4KB) = ~68KB ✗ unsupported
  */
 
 #include <torch/extension.h>
@@ -227,151 +226,11 @@ __global__ void flash_attn_v3_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scalar fallback kernel for D=256
-//
-// D=256 wmma would require:
-//   s_Q(16KB fp16) + s_K(16KB fp16) + s_V(32KB fp32) + s_S(4KB fp32) = ~68KB
-// This exceeds the T4's 48KB shared memory limit per block.
-// We fall back to __ldg scalar loads + scalar FMAs, identical to V2 logic.
-// ─────────────────────────────────────────────────────────────────────────────
-template <int D_DIM>
-__global__ void flash_attn_v3_scalar_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
-    float* __restrict__ O,
-    const int N, const int H
-) {
-    __shared__ float s_Q[BLOCK_SIZE][D_DIM + 1];
-    __shared__ float s_K[BLOCK_SIZE][D_DIM + 1];
-    __shared__ float s_V[BLOCK_SIZE][D_DIM + 1];
-
-    const int tx = threadIdx.x;
-
-    const int batch_idx    = blockIdx.z;
-    const int head_idx     = blockIdx.y;
-    const int q_tile_idx   = blockIdx.x;
-    const int global_q_idx = q_tile_idx * BLOCK_SIZE + tx;
-
-    const int slice_offset = (batch_idx * H + head_idx) * N * D_DIM;
-
-    const float* Q_slice = Q + slice_offset;
-    const float* K_slice = K + slice_offset;
-    const float* V_slice = V + slice_offset;
-    float*       O_slice = O + slice_offset;
-
-    const float scale = 1.0f / sqrtf((float)D_DIM);
-
-    float m_i = -FLT_MAX;
-    float l_i = 0.0f;
-    float O_i[D_DIM];
-    #pragma unroll
-    for (int k = 0; k < D_DIM; ++k) O_i[k] = 0.0f;
-
-    if (global_q_idx < N) {
-        const float* src = Q_slice + global_q_idx * D_DIM;
-        #pragma unroll
-        for (int k = 0; k < D_DIM; k += 4) {
-            s_Q[tx][k]   = __ldg(src + k);
-            s_Q[tx][k+1] = __ldg(src + k + 1);
-            s_Q[tx][k+2] = __ldg(src + k + 2);
-            s_Q[tx][k+3] = __ldg(src + k + 3);
-        }
-    } else {
-        #pragma unroll
-        for (int k = 0; k < D_DIM; ++k) s_Q[tx][k] = 0.0f;
-    }
-    __syncthreads();
-
-    const int num_kv_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    for (int kv_tile = 0; kv_tile < num_kv_blocks; ++kv_tile) {
-        if (kv_tile > q_tile_idx) break;
-
-        const int kv_row = kv_tile * BLOCK_SIZE + tx;
-
-        if (kv_row < N) {
-            const float* ksrc = K_slice + kv_row * D_DIM;
-            const float* vsrc = V_slice + kv_row * D_DIM;
-            #pragma unroll
-            for (int k = 0; k < D_DIM; k += 4) {
-                s_K[tx][k]   = __ldg(ksrc + k);
-                s_K[tx][k+1] = __ldg(ksrc + k + 1);
-                s_K[tx][k+2] = __ldg(ksrc + k + 2);
-                s_K[tx][k+3] = __ldg(ksrc + k + 3);
-                s_V[tx][k]   = __ldg(vsrc + k);
-                s_V[tx][k+1] = __ldg(vsrc + k + 1);
-                s_V[tx][k+2] = __ldg(vsrc + k + 2);
-                s_V[tx][k+3] = __ldg(vsrc + k + 3);
-            }
-        } else {
-            #pragma unroll
-            for (int k = 0; k < D_DIM; ++k) {
-                s_K[tx][k] = 0.0f;
-                s_V[tx][k] = 0.0f;
-            }
-        }
-        __syncthreads();
-
-        float S_ij[BLOCK_SIZE];
-        float m_j = -FLT_MAX;
-        #pragma unroll
-        for (int jj = 0; jj < BLOCK_SIZE; ++jj) {
-            float dot = 0.0f;
-            #pragma unroll
-            for (int k = 0; k < D_DIM; ++k)
-                dot += s_Q[tx][k] * s_K[jj][k];
-            S_ij[jj] = dot * scale;
-            int global_k_idx = kv_tile * BLOCK_SIZE + jj;
-            if (global_k_idx > global_q_idx) S_ij[jj] = -1e20f;
-            if (S_ij[jj] > m_j) m_j = S_ij[jj];
-        }
-
-        const float m_new     = fmaxf(m_i, m_j);
-        const float exp_scale = expf(m_i - m_new);
-
-        float exp_S[BLOCK_SIZE];
-        float l_j = 0.0f;
-        #pragma unroll
-        for (int jj = 0; jj < BLOCK_SIZE; ++jj) {
-            exp_S[jj] = expf(S_ij[jj] - m_new);
-            l_j += exp_S[jj];
-        }
-
-        const float l_new = exp_scale * l_i + l_j;
-
-        #pragma unroll
-        for (int k = 0; k < D_DIM; ++k)
-            O_i[k] *= exp_scale;
-
-        #pragma unroll
-        for (int jj = 0; jj < BLOCK_SIZE; ++jj) {
-            #pragma unroll
-            for (int k = 0; k < D_DIM; ++k)
-                O_i[k] += exp_S[jj] * s_V[jj][k];
-        }
-
-        m_i = m_new;
-        l_i = l_new;
-
-        __syncthreads();
-    }
-
-    if (global_q_idx < N) {
-        #pragma unroll
-        for (int k = 0; k < D_DIM; ++k)
-            O_slice[global_q_idx * D_DIM + k] = O_i[k] / l_i;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Explicit instantiations
 // ─────────────────────────────────────────────────────────────────────────────
 template __global__ void flash_attn_v3_kernel<64>(
     const float*, const float*, const float*, float*, const int, const int);
 template __global__ void flash_attn_v3_kernel<128>(
-    const float*, const float*, const float*, float*, const int, const int);
-template __global__ void flash_attn_v3_scalar_kernel<256>(
     const float*, const float*, const float*, float*, const int, const int);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,9 +251,13 @@ void dispatch_flash_attn_v3(
             flash_attn_v3_kernel<128><<<grid, block>>>(Q, K, V, O, N, H);
             break;
         case 256:
-            // D=256 wmma would need ~68KB shared memory, exceeding the 48KB
-            // T4 limit. Fall back to scalar __ldg kernel (V2-style).
-            flash_attn_v3_scalar_kernel<256><<<grid, block>>>(Q, K, V, O, N, H);
+            // D=256 exceeds the 48KB shared memory limit for both the wmma path
+            // (~68KB) and the scalar path (~99KB for three float[32][257] arrays).
+            // Supporting D=256 would require dynamic shared memory and a tiled
+            // approach along D — beyond the scope of this kernel.
+            TORCH_CHECK(false,
+                "D=256 is not supported: shared memory requirement (~68KB wmma, "
+                "~99KB scalar) exceeds the T4 48KB limit. Use d=64 or d=128.");
             break;
         default:
             TORCH_CHECK(false, "Unsupported head dim: ", D,
@@ -433,5 +296,5 @@ torch::Tensor flash_attn_v3_forward(torch::Tensor Q, torch::Tensor K, torch::Ten
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_attn_v3_forward", &flash_attn_v3_forward,
-          "FlashAttention V3 — wmma Tensor Core QKᵀ (d=64,128) + scalar fallback (d=256)");
+          "FlashAttention V3 — wmma Tensor Core QKᵀ (d=64,128); d=256 unsupported (exceeds 48KB SMEM)");
 }
