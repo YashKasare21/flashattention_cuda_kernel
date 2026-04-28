@@ -55,6 +55,8 @@ __global__ void flash_attn_v3_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
+    float* __restrict__ M_out,
+    float* __restrict__ L_out,
     const int N, const int H
 ) {
     // wmma::load_matrix_sync requires shared memory pointers to be 32-byte
@@ -219,6 +221,9 @@ __global__ void flash_attn_v3_kernel(
     }
 
     if (global_q_idx < N) {
+        const int ml_offset = (batch_idx * H + head_idx) * N;
+        M_out[ml_offset + global_q_idx] = m_i;
+        L_out[ml_offset + global_q_idx] = l_i;  // raw unnormalized sum of exp weights
         #pragma unroll
         for (int k = 0; k < D_DIM; ++k)
             O_slice[global_q_idx * D_DIM + k] = O_i[k] / l_i;
@@ -229,15 +234,16 @@ __global__ void flash_attn_v3_kernel(
 // Explicit instantiations
 // ─────────────────────────────────────────────────────────────────────────────
 template __global__ void flash_attn_v3_kernel<64>(
-    const float*, const float*, const float*, float*, const int, const int);
+    const float*, const float*, const float*, float*, float*, float*, const int, const int);
 template __global__ void flash_attn_v3_kernel<128>(
-    const float*, const float*, const float*, float*, const int, const int);
+    const float*, const float*, const float*, float*, float*, float*, const int, const int);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 void dispatch_flash_attn_v3(
     float* Q, float* K, float* V, float* O,
+    float* M_out, float* L_out,
     int B, int H, int N, int D
 ) {
     dim3 grid(N / BLOCK_SIZE, H, B);
@@ -245,10 +251,10 @@ void dispatch_flash_attn_v3(
 
     switch (D) {
         case 64:
-            flash_attn_v3_kernel<64><<<grid, block>>>(Q, K, V, O, N, H);
+            flash_attn_v3_kernel<64><<<grid, block>>>(Q, K, V, O, M_out, L_out, N, H);
             break;
         case 128:
-            flash_attn_v3_kernel<128><<<grid, block>>>(Q, K, V, O, N, H);
+            flash_attn_v3_kernel<128><<<grid, block>>>(Q, K, V, O, M_out, L_out, N, H);
             break;
         case 256:
             // D=256 exceeds the 48KB shared memory limit for both the wmma path
@@ -268,7 +274,8 @@ void dispatch_flash_attn_v3(
 // ─────────────────────────────────────────────────────────────────────────────
 // Python binding
 // ─────────────────────────────────────────────────────────────────────────────
-torch::Tensor flash_attn_v3_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+flash_attn_v3_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     TORCH_CHECK(Q.is_cuda(),                  "Q must be a CUDA tensor");
     TORCH_CHECK(Q.dtype() == torch::kFloat32, "Q must be float32");
     TORCH_CHECK(Q.dim() == 4,                 "Q must be 4D: [B, H, N, d]");
@@ -282,19 +289,24 @@ torch::Tensor flash_attn_v3_forward(torch::Tensor Q, torch::Tensor K, torch::Ten
     const int D = Q.size(3);
 
     auto O = torch::zeros_like(Q);
+    auto M = torch::empty({B, H, N}, Q.options());
+    auto L = torch::empty({B, H, N}, Q.options());
 
     dispatch_flash_attn_v3(
         Q.data_ptr<float>(),
         K.data_ptr<float>(),
         V.data_ptr<float>(),
         O.data_ptr<float>(),
+        M.data_ptr<float>(),
+        L.data_ptr<float>(),
         B, H, N, D
     );
 
-    return O;
+    return {O, M, L};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_attn_v3_forward", &flash_attn_v3_forward,
-          "FlashAttention V3 — wmma Tensor Core QKᵀ (d=64,128); d=256 unsupported (exceeds 48KB SMEM)");
+          "Returns (O, M, L) — O is attention output, M is per-row running max, "
+          "L is per-row unnormalized softmax sum");
 }
