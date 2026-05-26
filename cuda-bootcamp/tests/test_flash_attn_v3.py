@@ -23,7 +23,7 @@ V = torch.randn(B, H, N, D, device=device)
 
 # ── Correctness ───────────────────────────────────────────────────────────────
 ref = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-out_v3 = custom_flash_attn_v3.flash_attn_v3_forward(Q, K, V)
+out_v3, _, _ = custom_flash_attn_v3.flash_attn_v3_forward(Q, K, V)
 
 max_diff = (out_v3 - ref).abs().max().item()
 match    = max_diff < 1e-2
