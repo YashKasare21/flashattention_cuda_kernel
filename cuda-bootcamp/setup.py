@@ -40,6 +40,14 @@ setup(
             sources=['src/flash_attn_backward.cu'],
             extra_compile_args=_flags,
         ),
+        CUDAExtension(
+            name='custom_flash_attn_v5',
+            sources=['src/flash_attn_backward_v5.cu'],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': ['-O3', '--use_fast_math', '-lineinfo', '-arch=sm_75'],
+            },
+        ),
     ],
     cmdclass={'build_ext': BuildExtension},
 )
