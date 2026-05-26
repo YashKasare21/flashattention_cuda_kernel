@@ -10,7 +10,7 @@
  *   D_i     = sum_d( dO[i,d] * O[i,d] )         -- correction scalar
  *   dV[j]  += P[i,j] * dO[i]
  *   dP[i,j] = dot(dO[i], V[j])
- *   dS[i,j] = P[i,j] * (dP[i,j] - D_i)
+ *   dS[i,j] = P[i,j] * (dP[i,j] - D_i) * scale   -- scale propagated back through S=QK^T*scale
  *   dQ[i]  += dS[i,j] * K[j]                    -- local, no atomics
  *   dK[j]  += dS[i,j] * Q[i]                    -- atomicAdd (multiple Q-tiles)
  *
@@ -193,7 +193,9 @@ void flash_attn_backward_v5_kernel(
                     dP_ij += dO_reg[d] * s_V[jj][d];
 
                 // dS[i, jj] = P_ij * (dP_ij - D_i)
-                const float dS_ij = P_ij * (dP_ij - D_i);
+                // dQ[i] += dS_ij * dS/dQ = dS_ij * K[jj] * scale
+                // dK[jj] += dS_ij * dS/dK = dS_ij * Q[i] * scale
+                const float dS_ij = P_ij * (dP_ij - D_i) * scale;
 
                 // dQ[i] += dS_ij * K[jj]  (local, no atomics)
                 #pragma unroll
