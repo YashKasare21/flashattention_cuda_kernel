@@ -1,6 +1,6 @@
-# 🚀 FlashAttention-CUDA: High-Performance Attention from Scratch
+# FlashAttention CUDA Kernel — From Scratch
 
-**A hardware-aware implementation of the FlashAttention forward pass in pure CUDA C++.**
+**Hardware-aware FlashAttention forward + backward pass in pure CUDA C++, built iteratively from a scalar baseline to Tensor Core multi-warp production kernel.**
 
 ![CUDA](https://img.shields.io/badge/CUDA-12%2B-76B900?logo=nvidia&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)
@@ -8,132 +8,137 @@
 
 ---
 
-## 🎯 Elevator Pitch
+## 🚀 Key Results
 
-Standard attention mechanisms are **memory-bound**, not compute-bound. The naive implementation materializes an O(N²) attention matrix in slow global memory (HBM), forcing the GPU to repeatedly read and write gigabytes of intermediate state. This project bypasses the **Memory Wall** by implementing FlashAttention's SRAM tiling and online softmax algorithm, achieving **O(N) memory complexity** while maintaining exact numerical correctness. The result: linear memory scaling and competitive performance against PyTorch's optimized SDPA kernel.
+**Hardware:** Tesla T4 (SM75) · **Config:** B=2, H=4, N=1024, d=64, causal
 
----
+| Version | Time (ms) | Speedup vs V1 | Key Technique | Memory |
+|---------|-----------|---------------|---------------|--------|
+| V1 Baseline | 2.976 | 1.00× | Scalar FMAs | O(N) |
+| V2 `__ldg` + padding | 2.038 | 1.46× | Texture cache + bank-conflict fix | O(N) |
+| V3 Tensor Cores | 1.231 | 2.42× | WMMA fp16 QKᵀ | O(N) |
+| **V4 Multi-Warp** | **~1.0** | **~3×** | 4 warps × 128 threads | **O(N)** |
+| PyTorch SDPA | 0.401 | 7.43× | Optimized reference | — |
+| **V5 Backward** | — | — | Recompute P, exact gradients | **O(N)** |
 
-## 🏗️ System Architecture
-
-The diagram below shows the full project flow — from Python orchestration down to CUDA kernels executing on the GPU runtime, alongside the verification and benchmarking pipelines.
-
-![System Architecture](cuda-bootcamp/assets/architecture_diagram.png)
-
-**Three layers at a glance:**
-
-- **Python Orchestration** — `setup.py` builds the C++ extension; `run_benchmarks.py` drives timing experiments and writes the benchmark plot artifact.
-- **CUDA Extension** — Four kernels (`matmul.cu`, `matmul_tiled.cu`, `vector_add.cu`, `flash_attn_forward.cu`) are loaded as a PyTorch extension and execute on the CUDA runtime platform.
-- **Verification** — pytest suites (`test_matmul.py`, `online_softmax_test.py`, `test_flash_attn.py`) compare outputs against cuBLAS/PyTorch and PyTorch SDPA reference implementations.
+V4 forward matches PyTorch SDPA within numerical tolerance. V5 backward delivers exact dQ/dK/dV with O(N) memory — no O(N²) attention matrix stored.
 
 ---
 
-## 🔬 Key Architectural Features
+## 🏗️ Architecture
 
-### 🧠 SRAM Tiling & Memory Locality
+### Forward Pass (V1 → V4)
 
-The kernel eliminates the O(N²) memory bottleneck by **never materializing the full attention matrix**. Instead, Q, K, and V tensors are partitioned into `BLOCK_SIZE × d` tiles and loaded into **shared memory (SRAM)**, which offers ~100× higher bandwidth than global HBM. Each thread block operates on a single Q tile, iterating over K/V tiles to compute attention scores and accumulate outputs entirely within the memory hierarchy's fast tier.
+The core insight: standard attention is **memory-bound**, not compute-bound. The naive O(N²) attention matrix forces repeated HBM reads/writes. FlashAttention eliminates this by tiling Q, K, V into SRAM and fusing softmax with the matmul via an **online recurrence**.
 
-**Key insight:** By keeping working sets small (32×64 tiles = 8 KB), we fit comfortably within the 48 KB shared memory budget per SM, enabling full occupancy without spilling to L2 cache.
-
-### ⚡ Online Softmax Integration
-
-FlashAttention uses the **online softmax recurrence**, maintaining running statistics `(m_i, l_i)` — the max logit and sum of exponentials — and rescaling the output accumulator `O_i` as new tiles arrive:
-
+**Online softmax recurrence** (maintained per Q-tile, across KV tiles):
 ```
 m_new = max(m_i, max(S_tile))
 l_new = exp(m_i − m_new) · l_i + Σ exp(S_tile − m_new)
-O_i  *= exp(m_i − m_new)                          # rescale previous contribution
-O_i  += Σ_j exp(S_tile[j] − m_new) · V_tile[j]   # accumulate new weighted values
+O_i  *= exp(m_i − m_new)
+O_i  += Σ_j exp(S_tile[j] − m_new) · V_tile[j]
+```
+Final output: `O_i / l_i`. Exact — no approximation.
+
+**Optimization progression:**
+
+| | V1 | V2 | V3 | V4 |
+|---|---|---|---|---|
+| BLOCK_SIZE | 32 | 32 | 32 | **64** |
+| Threads/block | 32 | 32 | 32 | **128** |
+| QKᵀ compute | scalar FMA | scalar FMA | **WMMA fp16** | WMMA fp16 |
+| Global loads | plain | **`__ldg`** | `__ldg` | `__ldg` |
+| SMEM bank conflicts | 32-way | **~0** | ~947K | ~2.6M* |
+| SM Throughput (SOL) | ~8.5% | ~12% | ~8.5%† | — |
+
+*V3/V4 reintroduce minor conflicts to satisfy WMMA 32-byte alignment.  
+†Nsight `sm__throughput` tracks scalar cores only; Tensor Core execution is on a separate unit.
+
+**V4 multi-warp design** (BLOCK_SIZE=64, 4 warps):
+- Each warp owns 16 rows of the 64-row Q-tile
+- Phase 1: all 128 threads cooperatively load Q into SMEM
+- Phase 2: all 128 threads cooperatively load K, V into SMEM  
+- Phase 3: each warp computes its 16-row strip of S via WMMA (1×4 tile of 16×16 fragments)
+- Phase 4: each warp runs online softmax + PV accumulation independently
+
+SMEM budget (T4, 48 KB/SM): `s_Q(8KB) + s_K(8KB) + s_V(16KB) + s_S(16KB) = 48 KB` ✓
+
+**Two-level causal masking:**
+- Tile-level: `kv_tile > q_tile_idx → break` — skips ~51% of tiles for N=1024
+- Element-level: `k_idx > q_idx → S_ij = -∞` — handles diagonal tile boundaries
+
+### Backward Pass (V5)
+
+Recomputes attention weights P on-the-fly from saved `(M, L)` — no O(N²) storage.
+
+**Algorithm** (per Q-tile, iterating over causal KV tiles):
+```
+S_ij  = dot(Q_i, K_j) * scale          # recomputed
+P_ij  = exp(S_ij − M_i) / L_i          # recomputed from saved stats
+D_i   = sum_d(dO_i · O_i)              # softmax backward correction
+dV_j += P_ij * dO_i                    # atomicAdd
+dP_ij = dot(dO_i, V_j)
+dS_ij = P_ij * (dP_ij − D_i) * scale  # scale propagated back through S=QK^T*scale
+dQ_i += dS_ij * K_j                    # local accumulation, no atomics
+dK_j += dS_ij * Q_i                    # atomicAdd
 ```
 
-A single normalization `O_i / l_i` at the end produces the exact attention output, fusing three kernels into one with no approximation error.
+**Memory design:** Q and dO rows held in registers (128 floats/thread). Only K and V tiles in SMEM (32 KB). Total SMEM: 32 KB — well within 48 KB limit.
 
-### 🧩 4D Multi-Head Support
+---
 
-The kernel maps `[B, H, N, d]` tensors to a **3D CUDA grid**:
+## 📊 Benchmarks
 
-```cuda
-dim3 grid(N / BLOCK_SIZE,  H,  B);
-// Each block computes its pointer offset via strided arithmetic:
-size_t slice_offset = (blockIdx.z * H + blockIdx.y) * N * d;
+![Scaling Benchmark](assets/benchmark_seq_len.png)
+
+Sequence-length scaling (B=2, H=4, d=64, causal, T4 GPU). Custom kernel maintains constant performance ratio vs PyTorch SDPA across all lengths, confirming O(N) memory scaling.
+
+---
+
+## 🔧 Installation
+
+```bash
+git clone https://github.com/YashKasare21/flashattention_cuda_kernel.git
+cd flashattention_cuda_kernel
+pip install -e .
 ```
 
-Each `(batch, head)` pair is an independent computation with zero inter-block communication, scaling naturally to arbitrary batch sizes and head counts.
-
-### 🛡️ Two-Level Causal Masking
-
-| **Level** | **Condition** | **Action** | **Benefit** |
-|-----------|---------------|------------|-------------|
-| **Tile-level** | `kv_tile_idx > q_tile_idx` | `break` — skip entire tile | Reduces work from O(N²) to **O(N²/2)** |
-| **Element-level** | `k_idx > q_idx` | `S_ij = -∞` | Handles diagonal tile boundaries |
-
-The tile-level skip is warp-uniform, eliminating divergence penalties. For a 1024-token sequence with 32×32 tiles, this skips 528 of 1024 tile loads — a 51% reduction in memory traffic.
+**Requirements:** CUDA Toolkit 12.0+, PyTorch 2.0+, Python 3.8+, Tesla T4 or SM75+ GPU
 
 ---
 
-## 📊 Performance & Scaling
+## 🧪 Testing
 
-**Benchmark Configuration:** `B=2, H=4, d=64`, sequence lengths 256 → 4096, causal masking, 30 warmup + timing iterations.
+```bash
+# Forward correctness (V1–V4 vs PyTorch SDPA)
+python tests/test_flash_attn.py
+python tests/test_flash_attn_v4.py
 
-![Scaling Benchmark](cuda-bootcamp/assets/benchmark_seq_len.png)
+# Backward correctness (V5 dQ/dK/dV vs SDPA backward)
+python tests/test_backward_v5.py
+```
 
-The custom kernel maintains a **constant performance ratio** against PyTorch's SDPA across all sequence lengths, confirming correct O(N) memory scaling. The slight overhead versus SDPA stems from PyTorch's use of Tensor Cores (mixed-precision WMMA instructions) and software pipelining — optimizations beyond the scope of this educational implementation.
+Expected backward output:
+```
+[test_backward_kernel] B=2 H=4 N=512 D=64
+  dQ: max_diff=X.XXe-03  thr=1e-02  ✓
+  dK: max_diff=X.XXe-03  thr=5e-02  ✓
+  dV: max_diff=X.XXe-04  thr=5e-02  ✓
+```
 
----
+### Autograd usage
 
-## 🔍 Hardware Profiling & V2 Roadmap
+```python
+from functional import flash_attention
+import torch
 
-Profiled with NVIDIA Nsight Compute (ncu). The Speed of Light (SOL) report revealed the kernel is severely memory-bound:
+Q = torch.randn(2, 8, 1024, 64, device='cuda', requires_grad=True)
+K = torch.randn(2, 8, 1024, 64, device='cuda', requires_grad=True)
+V = torch.randn(2, 8, 1024, 64, device='cuda', requires_grad=True)
 
-| Metric | Value |
-|--------|-------|
-| Compute (SM) Throughput | ~8.5% |
-| Memory Throughput | ~36.0% |
-
-**Identified bottlenecks:**
-- **Uncoalesced global memory access** — threads utilize only 4 of 32 bytes per sector per transaction.
-- **Shared memory bank conflicts** — 32-way conflicts on ~96% of store wavefronts, forcing serialized accesses.
-
-**V2 Roadmap:**
-- ✅ Vectorized reads (`__ldg` gather) to route loads through the read-only texture cache.
-- ✅ Shared memory padding (`+1` column) to eliminate 32-way bank conflicts.
-- ✅ Tensor Core support (`wmma` API, 16×16×16 fp16 tiles) for the QKᵀ matrix multiply.
-- **V3 Remaining Gap** — V3 is still ~3× slower than PyTorch SDPA. The residual gap is due to software pipelining (async memory prefetch overlapping compute) and multi-warp occupancy tuning; closing it would require a full kernel redesign beyond the scope of this project.
-
----
-
-## 📈 Optimization Progression
-
-**V1 → V2 → V3 vs PyTorch SDPA** (T4 GPU, B=2 H=4 N=1024 d=64):
-
-| Version | Time (ms) | Speedup vs V1 | Key Technique | SM SOL |
-|---------|-----------|---------------|-------------------------------|--------|
-| V1 | 2.976 ms | 1.00× | Baseline scalar FMAs | ~8.5% |
-| V2 | 2.038 ms | 1.46× | `__ldg` + SMEM padding | ~12% |
-| V3 | 1.231 ms | 2.42× | wmma Tensor Core (fp16 QKᵀ) | ~8.5%* |
-| SDPA | 0.401 ms | 7.43× | PyTorch optimized | — |
-
-> *V3 SM throughput reads ~8.5% because Nsight's `sm__throughput` metric tracks scalar CUDA cores only. Tensor Core (wmma) execution runs on a separate hardware unit not captured by this counter — the 2.42× speedup over V1 confirms the Tensor Cores are active.
-
-### Hardware Profiling Detail
-
-| Metric | V1 Baseline | V2 Optimized | V3 Tensor Core |
-|-------------------------|-------------|--------------|----------------|
-| SM Throughput (SOL) | ~8.5% | ~12% | ~8.5%* |
-| SMEM bank conflicts (ld) | 1,892,551 | ~500 | ~947,000 |
-| SMEM bank conflicts (st) | 16,896,946 | ~8,700 | ~2,593,197 |
-| Global mem load % | ~0.86% | ~1.16% | ~1.40% |
-| Execution time | 2.976 ms | 2.038 ms | 1.231 ms |
-
-V2's near-zero bank conflicts came from the `+1` column padding on `s_Q`/`s_K`, which shifted each row by one float and spread accesses across all 32 banks. V3 had to remove that padding from the `__half` arrays to satisfy `wmma::load_matrix_sync`'s 32-byte alignment requirement — partially reintroducing conflicts (~947K load, ~2.6M store). This is a documented hardware tradeoff: alignment for Tensor Core access vs bank conflict avoidance. The Tensor Core gain wins decisively at 1.66× over V2 despite the regression. The remaining 3× gap to SDPA is explained by software pipelining (`cp.async` prefetch overlapping compute) and multi-warp occupancy tuning — neither is addressable within a single-warp-per-block kernel design.
-
-The two V2 changes each targeted a distinct bottleneck identified by Nsight Compute:
-
-- **SMEM padding (+1 column)** shifts each row by one float, spreading consecutive-thread accesses across all 32 banks and eliminating the 32-way conflicts that were serializing ~96% of shared memory store wavefronts — the dominant source of stall cycles in V1.
-- **`__ldg` loads** route global memory reads through the read-only texture cache rather than L1, reducing cache pressure and avoiding the strict 16-byte alignment requirement that caused `cudaErrorMisalignedAddress` with the original `float4` cast approach.
-- **V3 wmma** uses the `nvcuda::wmma` API to execute 16×16×16 matrix fragments on Tensor Core hardware, delivering ~8× the FMA throughput of scalar code. Q/K tiles are cast to fp16; the accumulator and V/O remain fp32.
-- The **remaining gap vs PyTorch SDPA** is structural: SDPA uses software pipelining (`cp.async` prefetch overlapping compute) and multi-warp occupancy tuning that would require a full kernel redesign to replicate.
+O = flash_attention(Q, K, V)   # causal, differentiable
+O.sum().backward()             # dQ, dK, dV populated
+```
 
 ---
 
@@ -141,80 +146,52 @@ The two V2 changes each targeted a distinct bottleneck identified by Nsight Comp
 
 ```
 flashattention_cuda_kernel/
-├── cuda-bootcamp/
-│   ├── src/
-│   │   ├── flash_attn_forward.cu    # FlashAttention forward kernel (main implementation)
-│   │   ├── matmul.cu                # Naive matrix multiplication baseline
-│   │   ├── matmul_tiled.cu          # Tiled shared-memory matmul (educational)
-│   │   └── vector_add.cu            # CUDA warm-up: parallel vector addition
-│   ├── tests/
-│   │   ├── test_flash_attn.py       # Correctness validation + timing vs PyTorch SDPA
-│   │   ├── test_matmul.py           # Matmul performance comparison (naive/tiled/cuBLAS)
-│   │   └── online_softmax_test.py   # Numerical verification of online softmax math
-│   ├── benchmarks/
-│   │   └── run_benchmarks.py        # Sequence-length scaling benchmark + plot generation
-│   ├── assets/
-│   │   ├── architecture_diagram.png # System architecture & data flow
-│   │   └── benchmark_seq_len.png    # Performance visualization
-│   └── setup.py                     # PyTorch C++ extension build configuration
-└── README.md
+├── src/
+│   ├── flash_attn_v1.cu          # Baseline scalar FMA
+│   ├── flash_attn_v2.cu          # __ldg + SMEM padding
+│   ├── flash_attn_v3.cu          # WMMA Tensor Cores (1 warp)
+│   ├── flash_attn_v4.cu          # Multi-warp production forward
+│   ├── flash_attn_backward_v5.cu # Backward pass (O(N) memory)
+│   ├── matmul.cu                 # Naive matmul baseline
+│   ├── matmul_tiled.cu           # Tiled shared-memory matmul
+│   └── vector_add.cu             # CUDA warm-up kernel
+├── tests/
+│   ├── test_flash_attn.py        # V1 correctness vs SDPA
+│   ├── test_flash_attn_v2.py     # V2 correctness
+│   ├── test_flash_attn_v3.py     # V3 correctness
+│   ├── test_flash_attn_v4.py     # V4 correctness + benchmark
+│   ├── test_backward_v5.py       # V5 gradient correctness
+│   ├── test_matmul.py            # Matmul vs cuBLAS
+│   └── online_softmax_test.py    # Online softmax math verification
+├── benchmarks/
+│   ├── benchmark.py              # V1–V4 head-to-head timing
+│   └── benchmark_backward.py     # Forward+backward vs SDPA
+├── assets/
+│   ├── benchmark_seq_len.png     # Scaling benchmark plot
+│   └── architecture_diagram.png  # System architecture
+├── functional.py                 # PyTorch autograd wrapper
+├── setup.py                      # Build all 5 CUDA extensions
+├── requirements.txt
+└── LICENSE
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🎯 What I Learned
 
-### Installation
-
-```bash
-git clone https://github.com/YashKasare21/flashattention_cuda_kernel.git
-cd flashattention_cuda_kernel/cuda-bootcamp
-pip install -e .
-```
-
-**Requirements:** CUDA Toolkit 12.0+, PyTorch 2.0+, Python 3.8+
-
-### Testing
-
-```bash
-python tests/test_flash_attn.py
-```
-
-**Expected output:**
-```
-Shape: Q/K/V = [2, 4, 1024, 64]  |  iterations = 20
-Max abs diff vs causal SDPA reference: 0.000XXX
-Results match (atol=1e-3):             True
-
-Custom causal FlashAttn:  X.XXX ms
-PyTorch causal SDPA:      X.XXX ms
-Speedup (Custom/SDPA):    X.XXx
-```
-
-### Benchmarking
-
-```bash
-python benchmarks/run_benchmarks.py
-# Plot saved to cuda-bootcamp/assets/benchmark_seq_len.png
-```
-
----
-
-## 🔧 Kernel Parameters
-
-| **Parameter** | **Value** | **Notes** |
-|---------------|-----------|-----------|
-| `BLOCK_SIZE` | 32 | Threads per block dimension / tile width |
-| `D_DIM` | 64 | Head dimension (compile-time constant) |
-| Shared memory | ~24 KB/block | `s_Q + s_K + s_V = 3 × 32 × 64 × 4 bytes` |
-| Grid dimensions | `(N/32, H, B)` | Sequence tiles × heads × batch |
+- **GPU memory hierarchy:** HBM → L2 → SMEM → registers, and how to exploit each tier
+- **Memory-bound optimization:** coalesced access patterns, SMEM bank conflict elimination via `+1` column padding
+- **Tensor Core programming:** WMMA fragment API, 32-byte alignment requirements, accumulator management
+- **CUDA profiling:** Nsight Compute SOL analysis, identifying bottlenecks (uncoalesced loads, 32-way bank conflicts)
+- **Algorithmic optimization:** online softmax recurrence, tiled backward pass with on-the-fly P recomputation
 
 ---
 
 ## 📚 References
 
-- **Dao et al.** (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
-- **Dao, T.** (2023). *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.* ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
+- Dao et al. (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
+- Dao (2023). *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.* ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
+- NVIDIA. *CUDA C++ Programming Guide.* [docs.nvidia.com](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
 
 ---
 
@@ -224,4 +201,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
-**Built with ⚡ by [Yash Kasare](https://github.com/YashKasare21) | Mumbai, India**
+**Built by [Yash Kasare](https://github.com/YashKasare21) · Mumbai, India**
