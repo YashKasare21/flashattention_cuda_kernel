@@ -8,11 +8,17 @@
   or delete them.
 - `src/flash_attn_backward_v6.cu` is a WIP V6 backward kernel (WMMA Tensor Cores —
   addresses V5's scalar matmuls, global atomics, and 255-register spills).
-  Committed as WIP (`5588400`), **GPU-untested**. The `store_matrix_sync` compile
-  errors (fp32 accumulator → `__half*` destination) were fixed with an explicit
-  `__float2half` conversion in `store_accum_half_smem`, and dQ is now flushed
-  straight from fragments via `store_accum_global` (removed an out-of-bounds
-  `s_Sp`→`float[64][64]` reinterpret). Still needs a build + correctness test
+  Committed as WIP (`5588400`), **GPU-untested**. Compile fixes landed so far:
+  `store_matrix_sync` fp32-accumulator → `__half*` errors fixed via explicit
+  `__float2half` in `store_accum_half_smem`; dQ flushed straight from fragments via
+  `store_accum_global` (removed an out-of-bounds `s_Sp`→`float[64][64]` reinterpret).
+  **Correctness bug found by line-by-line review vs V5 (not yet GPU-verified):**
+  `frag_dK`/`frag_dV` were persistent across the KV loop but the j-tile owned by
+  each warp is kv_tile-local (`kv_tile*64 + warp_id*16`), so the single out-of-loop
+  flush wrote mixed kv_tile contributions to rows `[warp_id*16..)` and left rows
+  `[64..)` unwritten → 100-500× dK/dV errors at N>64. Fixed by flushing (atomicAdd)
+  + zero-filling those fragments at the end of every kv_tile iteration (matches V5's
+  per-KV-tile accumulation). Still needs a build + correctness test
   (`tests/test_backward_v6.py`) + benchmark on a T4/Colab.
 - Archived profiling/design docs live in `docs/archive/`
   (`WRITEUP.md`, `CUDA_NOTES.md`), recovered from

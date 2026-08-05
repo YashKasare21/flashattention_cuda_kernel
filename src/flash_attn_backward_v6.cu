@@ -32,6 +32,14 @@
  *      global memory (store_accum_global), no SMEM staging. The previous
  *      reinterpret of the 8 KB s_Sp half[] as float[64][64] (16 KB) was an
  *      out-of-bounds SMEM write.
+ *   5. dK/dV cross-tile flush fix: frag_dK/frag_dV were persistent across the
+ *      KV loop but each kv_tile's j-tile is kv_tile-LOCAL (rows
+ *      [kv_tile*64 + warp_id*16, +16)), so a single out-of-loop flush wrote
+ *      mixed contributions to rows [warp_id*16..+16) and left rows [64..)
+ *      unwritten. They are now flushed (atomicAdd) and zero-filled at the end
+ *      of every kv_tile iteration, matching V5's per-KV-tile accumulation.
+ *      Within a kv_tile the per-warp j-tile partition still prevents any
+ *      4x over-counting.
  *
  * Shared memory (T4, 48 KB):
  *   s_Q  half [64][64] = 8 KB
@@ -237,10 +245,13 @@ void flash_attn_backward_v6_kernel(
 
     // ── Persistent WMMA accumulators ───────────────────────────────────────
     // frag_dQ[4]: this warp's 16 output rows × 4 d-tiles (full D=64).
-    // frag_dK[4]: this warp's 16 KV rows (warp_id tile) × 4 d-tiles.
-    //             Only accumulates contributions from this warp's i-tile,
-    //             so each warp's contribution is disjoint → no 4× over-count.
-    // frag_dV[4]: same shape as frag_dK.
+    //             Persistent across the KV loop — i-rows are block-fixed and
+    //             dQ[i,d] = sum over ALL j, so cross-tile accumulation is
+    //             required and correct.
+    // frag_dK[4], frag_dV[4]: this warp's 16 j-rows (kv_tile-local j-tile =
+    //             warp_id) × 4 d-tiles. NOT persistent: the j-tile moves with
+    //             kv_tile, so they are flushed to global and zero-filled at the
+    //             end of every kv_tile iteration (step 8).
     fragment<accumulator, 16, 16, 16, float> frag_dQ[4];
     fragment<accumulator, 16, 16, 16, float> frag_dK[4];
     fragment<accumulator, 16, 16, 16, float> frag_dV[4];
@@ -387,25 +398,29 @@ void flash_attn_backward_v6_kernel(
             }
         }
 
+        // ── 8) Flush dK/dV for THIS kv_tile → global (one atomicAdd/element) ──
+        // The j-tile owned by each warp is kv_tile-LOCAL: rows
+        // [kv_tile*BLOCK_SIZE + warp_id*16, +16). frag_dK/frag_dV must be
+        // flushed and zero-filled every iteration. (A persistent fragment
+        // would accumulate kv_tile=0 and kv_tile=1 contributions into the
+        // same local rows and the single out-of-loop flush would write them
+        // all to rows [warp_id*16..+16) — rows [64..) would be left unwritten
+        // and rows [0..64) double-counted. This was the V6 correctness bug.)
+        // atomicAdd across Q-tile blocks is still required: dK[j]/dV[j] for a
+        // fixed j receive contributions from every Q-tile block q_tile >= j/64.
+        {
+            const int j_base = kv_tile * BLOCK_SIZE + warp_id * 16;
+            #pragma unroll
+            for (int dt = 0; dt < 4; ++dt) {
+                flush_accum_atomic(frag_dK[dt], dK_slice, j_base, dt * 16, D_DIM, N, lane_id);
+                flush_accum_atomic(frag_dV[dt], dV_slice, j_base, dt * 16, D_DIM, N, lane_id);
+                fill_fragment(frag_dK[dt], 0.0f);
+                fill_fragment(frag_dV[dt], 0.0f);
+            }
+        }
+
         __syncthreads(); // protect s_K/s_V before next tile reloads
     } // end kv_tile loop
-
-    // ── Flush dK and dV accumulators → global (one atomicAdd per element) ──
-    // Each warp flushes frag_dK/frag_dV[dt] to the j-rows it owns.
-    // warp w accumulated contributions from i-rows [w*16..w*16+15] only,
-    // but those contribute to j-rows [w*16..w*16+15] of dK/dV.
-    // (In the causal case, warp w's dK[j] contribution comes only from
-    //  Q-tiles where q_tile_idx >= kv_tile; cross-block contributions land
-    //  via the same atomicAdd since multiple Q-tile blocks fire.)
-    {
-        const int j_base = warp_id * 16; // global j-row start for this warp
-        #pragma unroll
-        for (int dt = 0; dt < 4; ++dt) {
-            const int d_base = dt * 16;
-            flush_accum_atomic(frag_dK[dt], dK_slice, j_base, d_base, D_DIM, N, lane_id);
-            flush_accum_atomic(frag_dV[dt], dV_slice, j_base, d_base, D_DIM, N, lane_id);
-        }
-    }
 
     // ── Flush dQ accumulator → global (no atomics: dQ rows are owned by this
     // block only, and each warp owns its own 16-row strip) ────────────────
