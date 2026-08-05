@@ -3,31 +3,45 @@
 **Scope:** Why `src/flash_attn_backward_v5.cu` (V5 backward) is far slower per launch
 than `src/flash_attn_v4.cu` (V4 forward), beyond the "backward computes more" argument.
 
-**Method / trust level:** This is a **static source analysis** — every number below is
-either derived directly from the two kernel sources or from the repo's own README tables.
+**Method / trust level:** This is a **static source analysis** — the kernel-level facts are
+derived directly from the two kernel sources, and the timing numbers come from the fresh
+15-repeat T4 dataset in `results/bench_20260805.json`.
 Anything that requires a live GPU profile is explicitly tagged **`TODO: verify on GPU`**.
 No speculation is included.
 
 ---
 
-## 0. Headline numbers (from the repo's own README tables, B=2 H=4 d=64 causal)
+## 0. Headline numbers — from verified T4 data (`results/bench_20260805.json`)
 
-| N | V4 fwd (ms) | V5 bwd (ms) | time ratio | theoretical FLOP ratio | throughput ratio |
-|---|-------------|-------------|-----------:|------------------------|-----------------:|
-| 256  |  0.27 |   9.39 | 34.8× | 2.5× | 13.9× |
-| 512  |  0.66 |  25.08 | 38.0× | 2.5× | 15.2× |
-| 1024 |  1.91 |  87.47 | 45.8× | 2.5× | 18.3× |
-| 2048 |  6.37 | 311.53 | 48.9× | 2.5× | 19.6× |
-| 4096 | 23.47 | 1189.47 | 50.7× | 2.5× | 20.3× |
+Source: `benchmarks/run_all_benchmarks.py --repeats 15 --iters 15` on Tesla T4
+(B=2 H=4 d=64 causal, 15-round mean±std, seed 0). The `v4` record is the forward pass;
+the `v4+v5` record is **forward + backward together** (the benchmark times
+`flash_attention(…).backward(…)`), so **backward-only time is estimated as
+`v4+v5 − v4`** (an approximation that slightly overcounts backward by the launch/pipeline
+frontier between the two kernels).
+
+| N | V4 fwd (ms) | V4+V5 (ms) | V5 bwd est. (ms) | time ratio | theor. FLOP× | throughput× |
+|---|-------------|------------|------------------:|-----------:|------------:|-----------:|
+| 256  | 0.130 ± 0.000 |  5.064 ± 0.031 |  4.934 | 38.0× | 2.5× | 15.2× |
+| 512  | 0.354 ± 0.001 | 15.840 ± 0.057 | 15.485 | 43.7× | 2.5× | 17.5× |
+| 1024 | 1.087 ± 0.003 | 46.459 ± 0.263 | 45.373 | 41.8× | 2.5× | 16.7× |
+| 2048 | 3.475 ± 0.004 | 164.971 ± 1.251 | 161.496 | 46.5× | 2.5× | 18.6× |
+| 4096 | 12.261 ± 0.011 | 627.306 ± 8.922 | 615.045 | 50.2× | 2.5× | 20.1× |
+
+> **Note on earlier numbers:** the README tables previously cited e.g. V4 fwd 23.47 ms and
+> V5 bwd 1189.47 ms at N=4096. Those were old hardcoded, single-run figures (previously
+> flagged as unverified/unreproducible) and are **superseded** by the 15-repeat data above
+> (which shows V4 fwd 12.26 ms and V5 bwd ~615 ms at N=4096). Only the verified dataset is
+> used in this analysis.
 
 FLOP model (causal): forward = `2·B·H·N²·D`; backward = `5·B·H·N²·D`
 (recompute S + dP + dQ + dK + dV matmuls, each `2·N²·D`, causal ≈ half).
 Theoretical backward vs forward work = **2.5×**.
 
-**The premise "15–20×" maps to the achieved-throughput ratio** (V4 ~562 GFLOPS vs V5
-~31 GFLOPS at N=1024). The **raw wall-clock ratio is actually 35–51×**, which is even
-larger. Either framing, >2.5× of the gap is *not* explained by FLOPs — it is
-implementation-level inefficiency.
+**The premise "15–20×" maps to the achieved-throughput ratio** (e.g. V4 ~988 GFLOPS vs V5
+~59 GFLOPS at N=1024). The **raw wall-clock ratio is ~38–50×**, which is even larger.
+Either framing, >2.5× of the gap is *not* explained by FLOPs — it is implementation-level
+inefficiency.
 
 ---
 
@@ -130,7 +144,7 @@ and the fix is smaller D-tiles / non-register staging.
 
 ---
 
-## 5. Bottom line: where the 2.5× ⇒ 35–51× gap comes from
+## 5. Bottom line: where the 2.5× ⇒ ~38–50× gap comes from (verified T4 data)
 
 | Factor | Status | Effect |
 |---|---|---|
@@ -141,20 +155,21 @@ and the fix is smaller D-tiles / non-register staging.
 | Register spilling | static estimate | ≥192 live regs/thread, likely over 255 limit → local-mem load/store in hot loop |
 | `expf` count | verified | ~equal to forward (64/row/tile) → neutral |
 
-**Decomposition (time ratio):** `2.5×` (FLOPs) ✕ `~14–20×` (implementation inefficiency:
+**Decomposition (time ratio):** `2.5×` (FLOPs) ✕ `~15–20×` (implementation inefficiency:
 scalar-vs-TensorCore + atomic RMW + spills).
 
 **Decomposition (throughput ratio):** matches the user-reported ~15–20× directly
-(V4 ~560 GFLOPS vs V5 ~31 GFLOPS at N=1024).
+(e.g. V4 ~988 GFLOPS vs V5 ~59 GFLOPS at N=1024; 1,401 vs 70 GFLOPS at N=4096).
 
 ---
 
 ## Ready-to-cite Paper Limitations paragraph
 
 > The custom backward kernel (V5) recomputes attention weights from saved statistics,
-> which is exact and O(N)-memory, but it is ~35–51× slower per launch than the V4 forward
-> (≈15–20× slower in achieved throughput, 562→31 GFLOPS at N=1024). Only 2.5× of this is
-> inherent to the greater FLOP count of the backward pass. The remaining ~14–20× stems from
+> which is exact and O(N)-memory, but it is ~38–50× slower per launch than the V4 forward
+> (≈15–20× slower in achieved throughput, e.g. 988→59 GFLOPS at N=1024, measured on T4 with
+> 15-repetition timing). Only 2.5× of this is inherent to the greater FLOP count of the
+> backward pass. The remaining ~15–20× stems from
 > implementation choices: (i) the forward pass's QKᵀ matmul runs on fp16 Tensor Cores while
 > the backward run always scalar fp32 FMA, forfeiting the ~8× tensor throughput on every
 > matmul; (ii) dK/dV are accumulated in global memory via atomicAdd (8,192 per thread per
