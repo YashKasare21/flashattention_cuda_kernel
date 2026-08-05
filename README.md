@@ -16,22 +16,32 @@
 
 | Version | Seq=256 | Seq=512 | Seq=1024 | Seq=2048 | Seq=4096 | vs SDPA | Memory |
 |---------|---------|---------|----------|----------|----------|---------|--------|
-| V1 Baseline | 1.02 ms | 2.92 ms | 8.47 ms | 17.20 ms | 52.47 ms | 4.5× slower | O(N) mem, O(N²) compute |
-| V2 `__ldg` + padding | 0.30 ms | 0.89 ms | 3.05 ms | 11.47 ms | 44.32 ms | 3.8× slower | O(N) mem, O(N²) compute |
-| V3 Tensor Cores | 0.23 ms | 0.66 ms | 2.25 ms | 7.96 ms | 30.19 ms | 2.6× slower | O(N) |
-| **V4 Multi-Warp** | **0.27 ms** | **0.66 ms** | **1.91 ms** | **6.37 ms** | **23.47 ms** | **2.0× slower** 🎯 | **O(N)** |
-| PyTorch SDPA | 0.11 ms | 0.25 ms | 0.71 ms | 2.83 ms | 11.77 ms | 1.0× | — |
+| V1 Baseline | 0.455 ± 0.002 | 0.686 ± 0.006 | 2.162 ± 0.040 | 7.390 ± 0.046 | 27.200 ± 0.067 | 4.4–5.1× slower | O(N) mem, O(N²) compute |
+| V2 `__ldg` + padding | 0.363 ± 0.001 | 0.541 ± 0.003 | 1.707 ± 0.007 | 6.068 ± 0.016 | 22.781 ± 0.042 | 3.5–4.0× slower | O(N) mem, O(N²) compute |
+| V3 Tensor Cores | 0.256 ± 0.042 | 0.371 ± 0.002 | 1.213 ± 0.006 | 4.214 ± 0.021 | 15.484 ± 0.034 | 2.4–2.8× slower | O(N) |
+| **V4 Multi-Warp** | **0.130 ± 0.000** | **0.354 ± 0.001** | **1.087 ± 0.003** | **3.475 ± 0.004** | **12.261 ± 0.011** | **~2× slower (1.3–2.5×)** 🎯 | **O(N)** |
+| PyTorch SDPA | 0.097 ± 0.001 | 0.155 ± 0.001 | 0.427 ± 0.023 | 1.528 ± 0.051 | 5.645 ± 0.039 | 1.0× | — |
 
-**V4 is ~2× slower than PyTorch SDPA; its core contribution is O(N) memory complexity, not raw speed.**
+**V4 is ~2× slower than PyTorch SDPA (1.3–2.5× across N); its core contribution is O(N) memory complexity, not raw speed.**
 
 ### Backward Pass (Tesla T4, B=2, H=4, d=64, causal)
 
 | Version | Seq=256 | Seq=512 | Seq=1024 | Seq=2048 | Seq=4096 | Memory |
 |---------|---------|---------|----------|----------|----------|--------|
-| **V5 Custom** | **9.39 ms** | **25.08 ms** | **87.47 ms** | **311.53 ms** | **1189.47 ms** | **O(N)** ✅ |
-| PyTorch SDPA | 0.72 ms | 1.41 ms | 4.42 ms | 13.48 ms | 49.82 ms | O(N²) |
+| **V4+V5 (forward+backward)** | **5.064 ± 0.031** | **15.840 ± 0.057** | **46.459 ± 0.263** | **164.971 ± 1.251** | **627.306 ± 8.922** | **O(N)** ✅ |
+| V5 backward (est. = total − V4 fwd) | 4.934 | 15.485 | 45.373 | 161.496 | 615.045 | O(N) |
+| PyTorch SDPA (forward+backward) | 0.445 ± 0.011 | 0.749 ± 0.018 | 2.254 ± 0.036 | 6.909 ± 0.037 | 27.729 ± 0.089 | O(N²) |
 
-**V5 delivers dQ/dK/dV gradients matching PyTorch within test tolerances (dQ max_diff < 1e-2, dK/dV max_diff < 5e-2) and reduces memory complexity from O(N²) to O(N).**
+**V5 delivers dQ/dK/dV gradients matching PyTorch within test tolerances (dQ max_diff < 1e-2, dK/dV max_diff < 5e-2) and reduces memory complexity from O(N²) to O(N). Its backward pass dominates end-to-end time (≈97–98%) and runs ~14–30× slower than PyTorch SDPA's backward.**
+
+> **Note on data provenance:** All timings above come from the **verified** 15-repeat T4
+> dataset in `results/bench_20260805.json` (B=2, H=4, d=64, causal, seed 0; mean±std in ms).
+> The `v4+v5` record times `flash_attention(…).backward(…)` — forward **and** backward
+> launches together — so backward-only time is **estimated as `(v4+v5) − v4`**. Numbers
+> previously claimed in this README (e.g. V4 fwd 1.91 ms / V5 bwd 87.47 ms at N=1024, and
+> V4 fwd 23.47 ms / V5 bwd 1189.47 ms at N=4096) were old hardcoded single-run figures,
+> previously flagged as unverified/unreproducible, and are now **superseded** by the data
+> above.
 
 ---
 

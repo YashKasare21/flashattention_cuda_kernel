@@ -29,11 +29,12 @@ frontier between the two kernels).
 | 2048 | 3.475 ± 0.004 | 164.971 ± 1.251 | 161.496 | 46.5× | 2.5× | 18.6× |
 | 4096 | 12.261 ± 0.011 | 627.306 ± 8.922 | 615.045 | 50.2× | 2.5× | 20.1× |
 
-> **Note on earlier numbers:** the README tables previously cited e.g. V4 fwd 23.47 ms and
-> V5 bwd 1189.47 ms at N=4096. Those were old hardcoded, single-run figures (previously
-> flagged as unverified/unreproducible) and are **superseded** by the 15-repeat data above
-> (which shows V4 fwd 12.26 ms and V5 bwd ~615 ms at N=4096). Only the verified dataset is
-> used in this analysis.
+> **Note on earlier numbers:** the README tables previously cited e.g. V4 fwd 1.91 ms /
+> V5 bwd 87.47 ms at N=1024 and V4 fwd 23.47 ms / V5 bwd 1189.47 ms at N=4096. Those were
+> old hardcoded, single-run figures (previously flagged as unverified/unreproducible) and
+> are **superseded** by the 15-repeat data above (which shows V4 fwd 1.087 ms / V5 bwd
+> ~45.37 ms at N=1024 and V4 fwd 12.26 ms / V5 bwd ~615 ms at N=4096). Only the verified
+> dataset is used in this analysis.
 
 FLOP model (causal): forward = `2·B·H·N²·D`; backward = `5·B·H·N²·D`
 (recompute S + dP + dQ + dK + dV matmuls, each `2·N²·D`, causal ≈ half).
