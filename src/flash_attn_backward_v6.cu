@@ -23,17 +23,28 @@
  *   2. dK/dV warp-duplication fix: each warp accumulates only its own 16
  *      i-rows (it=warp_id), so frag_dK/frag_dV shrink to 4 frags each;
  *      no 4x over-counting.
- *   3. dQ precision: fp32 frag stored into __shared__ float[16][64] window
- *      (reusing dead s_Sp) — no fp16 quantization on dQ.
+ *   3. store_matrix_sync type fix: accumulator fragments are fp32, so
+ *      store_matrix_sync cannot target a __half* destination (T must match
+ *      the fragment's fp32 element type). S/dP are written to s_Sp/s_dP
+ *      via store_accum_half_smem with an explicit __float2half conversion
+ *      (S and P stay fp16 in SMEM by design — see precision note).
+ *   4. dQ precision/staging fix: fp32 dQ fragments are flushed straight to
+ *      global memory (store_accum_global), no SMEM staging. The previous
+ *      reinterpret of the 8 KB s_Sp half[] as float[64][64] (16 KB) was an
+ *      out-of-bounds SMEM write.
  *
  * Shared memory (T4, 48 KB):
  *   s_Q  half [64][64] = 8 KB
  *   s_dO half [64][64] = 8 KB
  *   s_K  half [64][64] = 8 KB
  *   s_V  half [64][64] = 8 KB
- *   s_Sp half [64][64] = 8 KB   (S -> P in-place; later reused as float dQ stage)
+ *   s_Sp half [64][64] = 8 KB   (S -> P in-place)
  *   s_dP half [64][64] = 8 KB   (dP -> dS in-place)
  *   Total = 48 KB exactly ✓
+ *
+ * Note: keeping s_Sp/s_dP as fp16 (with __float2half at store time) is what
+ * keeps the footprint at 48 KB — promoting them to float arrays would need
+ * 64 KB total, over the T4 static-SMEM limit.
  *
  * Precision note: S and P are stored fp16 to fit budget.  S*scale stays
  * within ~±8 so fp16 relative error ~5e-4; dQ (no atomics) stays within the
@@ -96,17 +107,20 @@ void flush_accum_atomic(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: store one accumulator fragment to __shared__ float[][D_DIM].
-// Same SM75 layout as above but writes to SMEM (no atomics needed).
+// Helper: store one fp32 accumulator fragment to a __shared__ __half array
+// with an explicit fp32->fp16 conversion. Same SM75 layout as
+// flush_accum_atomic. Used for s_Sp (S/P) and s_dP (dP/dS) because
+// store_matrix_sync cannot target a __half* destination for accumulator
+// fragments (the pointer type T must match the fragment's fp32 type).
 // smem_row_start is the row offset within the shared array.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__
-void store_accum_smem(
+void store_accum_half_smem(
     const fragment<accumulator, 16, 16, 16, float>& frag,
-    float* smem,                 // pointer to smem[0][0]
+    __half* smem,                // pointer to smem[0][0]
     const int smem_row_start,
     const int smem_col_start,
-    const int smem_stride,       // columns in smem (= D_DIM)
+    const int smem_stride,       // columns in smem (= BLOCK_SIZE)
     const int lane_id
 ) {
     #pragma unroll
@@ -114,7 +128,36 @@ void store_accum_smem(
         const int local_row = (lane_id / 4) + ((e >= 4) ? 8 : 0);
         const int local_col = (lane_id % 4) * 2 + (e % 2) + ((e % 4 >= 2) ? 8 : 0);
         smem[(smem_row_start + local_row) * smem_stride + (smem_col_start + local_col)]
-            = frag.x[e];
+            = __float2half(frag.x[e]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: store one accumulator fragment to global memory with a plain store
+// (no atomics — caller guarantees each element has a unique owner, e.g. dQ,
+// which is disjoint across blocks and warps). Same SM75 layout as
+// flush_accum_atomic. frag_row/frag_col are the top-left corner of the
+// 16x16 tile in the global (N x D_DIM) output matrix.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__
+void store_accum_global(
+    const fragment<accumulator, 16, 16, 16, float>& frag,
+    float* __restrict__ dst,     // pointer to start of row 0 of this output block
+    const int frag_row_start,    // global row offset of this tile's row-0
+    const int frag_col_start,    // global col offset of this tile's col-0
+    const int stride,            // row stride of dst (= D_DIM)
+    const int N,
+    const int lane_id
+) {
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const int local_row = (lane_id / 4) + ((e >= 4) ? 8 : 0);
+        const int local_col = (lane_id % 4) * 2 + (e % 2) + ((e % 4 >= 2) ? 8 : 0);
+        const int g_row = frag_row_start + local_row;
+        const int g_col = frag_col_start + local_col;
+        if (g_row < N) {
+            dst[g_row * stride + g_col] = frag.x[e];
+        }
     }
 }
 
@@ -135,8 +178,6 @@ void flash_attn_backward_v6_kernel(
 ) {
     // ── Shared memory (48 KB total) ────────────────────────────────────────
     // All half arrays: 8 KB each, 6 × 8 = 48 KB.
-    // s_Sp is later reused as a float[16][64] dQ staging window per warp.
-    // 16×64 floats = 4 KB < 8 KB (s_Sp size), so it fits with 2× headroom.
     __shared__ __align__(32) __half s_Q  [BLOCK_SIZE][D_DIM];
     __shared__ __align__(32) __half s_dO [BLOCK_SIZE][D_DIM];
     __shared__ __align__(32) __half s_K  [BLOCK_SIZE][D_DIM];
@@ -246,8 +287,8 @@ void flash_attn_backward_v6_kernel(
             }
             #pragma unroll
             for (int ct = 0; ct < 4; ++ct)
-                store_matrix_sync(&s_Sp[warp_id * 16][ct * 16],
-                                  sF[ct], BLOCK_SIZE, mem_row_major);
+                store_accum_half_smem(sF[ct], &s_Sp[0][0],
+                                      warp_id * 16, ct * 16, BLOCK_SIZE, lane_id);
         }
         __syncthreads();
 
@@ -282,8 +323,8 @@ void flash_attn_backward_v6_kernel(
             }
             #pragma unroll
             for (int ct = 0; ct < 4; ++ct)
-                store_matrix_sync(&s_dP[warp_id * 16][ct * 16],
-                                  pF[ct], BLOCK_SIZE, mem_row_major);
+                store_accum_half_smem(pF[ct], &s_dP[0][0],
+                                      warp_id * 16, ct * 16, BLOCK_SIZE, lane_id);
         }
         __syncthreads();
 
@@ -366,30 +407,17 @@ void flash_attn_backward_v6_kernel(
         }
     }
 
-    // ── Flush dQ accumulator → global (no atomics: dQ is local per block) ──
-    // Stage fp32 into s_Sp (reinterpreted as float[16][64] per warp).
-    // s_Sp is dead after the KV loop. Each warp uses its own 16-row slice
-    // → no inter-warp conflicts. Warps proceed in sequence (warp 0 first)
-    // gated by __syncthreads to keep SMEM safe.
+    // ── Flush dQ accumulator → global (no atomics: dQ rows are owned by this
+    // block only, and each warp owns its own 16-row strip) ────────────────
+    // Fragments are fp32 and flushed straight to global with the same SM75
+    // layout used for dK/dV. No SMEM staging is needed (reinterpreting the
+    // 8 KB s_Sp half array as float[64][64] would overflow it).
     {
-        // Reinterpret s_Sp as float, each warp gets rows [warp_id*16..+16).
-        // s_Sp is half[64][64] = 8192 halfs = 16384 bytes.
-        // float[64][64] = 16384 bytes fits exactly in the same space.
-        float* dQ_stage = reinterpret_cast<float*>(s_Sp); // float[64][64]
-
+        const int q_base = q_tile_idx * BLOCK_SIZE + warp_id * ROWS_PER_WARP;
         #pragma unroll
         for (int dt = 0; dt < 4; ++dt) {
-            store_accum_smem(frag_dQ[dt], dQ_stage,
-                             warp_id * 16, dt * 16, D_DIM, lane_id);
-        }
-        __syncthreads(); // all warps finish writing their slice
-
-        // Row owners (lane 0..15) write from SMEM to global dQ.
-        if (lane_id < ROWS_PER_WARP && global_q_idx < N) {
-            #pragma unroll
-            for (int d = 0; d < D_DIM; ++d)
-                dQ_slice[global_q_idx * D_DIM + d] =
-                    dQ_stage[tr * D_DIM + d];
+            store_accum_global(frag_dQ[dt], dQ_slice,
+                               q_base, dt * 16, D_DIM, N, lane_id);
         }
     }
 } // end kernel
