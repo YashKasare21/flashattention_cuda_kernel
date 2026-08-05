@@ -165,8 +165,11 @@ flashattention_cuda_kernel/
 │   ├── test_flash_attn_v4.py     # V4 correctness + benchmark
 │   └── test_backward_v5.py       # V5 gradient correctness
 ├── benchmarks/
-│   ├── benchmark.py              # V1–V4 head-to-head timing
-│   └── benchmark_backward.py     # Forward+backward vs SDPA
+│   ├── run_all_benchmarks.py      # Single entry point: forward + backward
+│   ├── benchmark.py               # Forward V1–V4 vs SDPA, D=64/128, mean±std
+│   ├── benchmark_backward.py      # Forward+backward (V4+V5) vs SDPA
+│   └── bench_utils.py             # Timing, TFLOPS, GPU metadata, JSON save
+├── results/                       # Generated JSON benchmark data
 ├── assets/
 │   ├── benchmark_forward_v4.png  # Forward scaling benchmark
 │   ├── benchmark_backward_v5.png # Backward benchmark
