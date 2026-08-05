@@ -6,7 +6,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> Built a hardware-aware FlashAttention CUDA kernel from scratch — SRAM tiling, online softmax, Tensor Cores, multi-warp blocks, and exact backward pass gradients. V4 forward approaches PyTorch SDPA speed on Tesla T4. V5 backward delivers O(N) memory with exact numerical match.
+> Built a hardware-aware FlashAttention CUDA kernel from scratch — SRAM tiling, online softmax, Tensor Cores, multi-warp blocks, and a validated backward pass. V4 forward approaches PyTorch SDPA speed on Tesla T4. V5 backward delivers O(N) memory with gradients verified against PyTorch within test tolerances.
 
 ---
 
@@ -16,13 +16,13 @@
 
 | Version | Seq=256 | Seq=512 | Seq=1024 | Seq=2048 | Seq=4096 | vs SDPA | Memory |
 |---------|---------|---------|----------|----------|----------|---------|--------|
-| V1 Baseline | 1.02 ms | 2.92 ms | 8.47 ms | 17.20 ms | 52.47 ms | 4.5× slower | O(N²) |
-| V2 `__ldg` + padding | 0.30 ms | 0.89 ms | 3.05 ms | 11.47 ms | 44.32 ms | 3.8× slower | O(N²) |
+| V1 Baseline | 1.02 ms | 2.92 ms | 8.47 ms | 17.20 ms | 52.47 ms | 4.5× slower | O(N) mem, O(N²) compute |
+| V2 `__ldg` + padding | 0.30 ms | 0.89 ms | 3.05 ms | 11.47 ms | 44.32 ms | 3.8× slower | O(N) mem, O(N²) compute |
 | V3 Tensor Cores | 0.23 ms | 0.66 ms | 2.25 ms | 7.96 ms | 30.19 ms | 2.6× slower | O(N) |
 | **V4 Multi-Warp** | **0.27 ms** | **0.66 ms** | **1.91 ms** | **6.37 ms** | **23.47 ms** | **2.0× slower** 🎯 | **O(N)** |
 | PyTorch SDPA | 0.11 ms | 0.25 ms | 0.71 ms | 2.83 ms | 11.77 ms | 1.0× | — |
 
-**V4 achieves 2× of SDPA speed with O(N) memory — the memory complexity reduction is the core win.**
+**V4 is ~2× slower than PyTorch SDPA; its core contribution is O(N) memory complexity, not raw speed.**
 
 ### Backward Pass (Tesla T4, B=2, H=4, d=64, causal)
 
@@ -31,7 +31,7 @@
 | **V5 Custom** | **9.39 ms** | **25.08 ms** | **87.47 ms** | **311.53 ms** | **1189.47 ms** | **O(N)** ✅ |
 | PyTorch SDPA | 0.72 ms | 1.41 ms | 4.42 ms | 13.48 ms | 49.82 ms | O(N²) |
 
-**V5 delivers exact dQ/dK/dV gradients (max diff < 0.002) with 2× memory reduction vs standard attention.**
+**V5 delivers dQ/dK/dV gradients matching PyTorch within test tolerances (dQ max_diff < 1e-2, dK/dV max_diff < 5e-2) and reduces memory complexity from O(N²) to O(N).**
 
 ---
 
@@ -94,7 +94,7 @@ dQ_i += dS_ij * K_j                    # local accumulation, no atomics
 dK_j += dS_ij * Q_i                    # atomicAdd
 ```
 
-**Memory design:** Q and dO rows held in registers (128 floats/thread). Only K and V tiles in SMEM (32 KB total).
+**Memory design:** Q, dO, O, and dQ rows held in registers (256 floats/thread: Q_reg + dO_reg + O_reg + dQ_acc, 64 floats each). Only K and V tiles in SMEM (32 KB total).
 
 ---
 
