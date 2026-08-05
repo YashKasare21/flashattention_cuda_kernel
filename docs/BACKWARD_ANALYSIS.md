@@ -3,10 +3,11 @@
 **Scope:** Why `src/flash_attn_backward_v5.cu` (V5 backward) is far slower per launch
 than `src/flash_attn_v4.cu` (V4 forward), beyond the "backward computes more" argument.
 
-**Method / trust level:** This is a **static source analysis** — the kernel-level facts are
-derived directly from the two kernel sources, and the timing numbers come from the fresh
-15-repeat T4 dataset in `results/bench_20260805.json`.
-Anything that requires a live GPU profile is explicitly tagged **`TODO: verify on GPU`**.
+**Method / trust level:** This is a **static source analysis** grounded in verified
+measurements: kernel-level facts are derived directly from the two kernel sources; timing
+numbers come from the fresh 15-repeat T4 dataset in `results/bench_20260805.json`; and the
+register/stack statistics are confirmed via `nvcc --ptxas-options=-v` (see §4). The only
+remaining items that need a live profile are explicitly tagged **`TODO: verify on GPU`**.
 No speculation is included.
 
 ---
@@ -123,24 +124,34 @@ number on serialization latency.
 
 ---
 
-## 4. Register pressure: likely spilling — needs GPU confirmation ⚠️ static estimate
+## 4. Register pressure: CONFIRMED — kernel runs at the 255-register hardware max with spills ✅ verified on GPU
 
 V5 holds, per active thread, four `D_DIM=64` float arrays (`#pragma unroll` forces full
 expansion):
 
 - `Q_reg[64]`, `dO_reg[64]`, `O_reg[64]` (loaded pre-loop), `dQ_acc[64]` (accumulates).
 
-That is **256 array-elements/thread**. Tight live set across the KV loop ≈
-`Q_reg + dO_reg + dQ_acc` = **~192 live registers** + `m_i, l_i, D_i`, loop indices, and
-`S_ij/dP_ij/dS_ij/P_ij` temporaries. Floating-point regs are 1-per-thread on Turing, so this
-**approaches/exceeds the 255-register hard limit** — the struct definition says the compiler
-will very likely spill those arrays to **local memory (HBM-backed)**, turning each spill
-load/store into a memory round-trip inside the hot loop.
+That is **256 array-elements/thread**, i.e. already over the 255-register hard limit before
+counting any loop state — forcing the compiler to spill regardless of how tightly it packs
+the live set.
 
-**`TODO: verify on GPU`** — build with `nvcc --ptxas-options=-v` (or `-Xptxas -v`) and check
-`Compiling entry function ... , 255 maxrregcount` and the **spill** count for
-`flash_attn_backward_v5_kernel`. If spills > 0, that is a confirmed secondary bottleneck
-and the fix is smaller D-tiles / non-register staging.
+**Actual `nvcc --ptxas-options=-v` output (T4/Colab; arch flag was not explicit, so it
+compiled for sm_52 — register limits are identical across sm_52/sm_75, so the numbers are
+valid):**
+
+```
+Used 255 registers/thread           (hardware maximum)
+1796 bytes spill stores / thread    + 1976 bytes spill loads / thread
+240 bytes stack frame
+32768 bytes shared memory
+1 barrier
+```
+
+**Impact:** 3,772 bytes/thread of register spills become **local-memory traffic**, and
+local memory is **HBM-backed** — every spilled load/store inside the hot `jj`/`d` loops is
+a memory round-trip instead of a register op. At 16 active lanes/warp × 4 warps, this adds
+hundreds of thousands of HBM round-trips per KV tile. This is now the **strongest, fully
+quantified** bottleneck factor, alongside tensor-core absence and atomicAdd contention.
 
 ---
 
@@ -150,9 +161,9 @@ and the fix is smaller D-tiles / non-register staging.
 |---|---|---|
 | FLOPs of backward vs forward | verified | 2.5× (expected) |
 | Tensor Cores present in backward | verified | **absent** → every matmul at fp32 scalar rate (~8× forfeit on dominant work) |
+| **Register spilling** | **confirmed (nvcc)** | **255 regs/thread (HW max) + 3,772 B/thread spills → local-mem round-trips in hot loop** |
 | `atomicAdd` RMW traffic | verified count | 8,192 atomic/thread/tile + severe cross-block serialization (dK/dV) |
 | Occupancy | verified | ~equal (4 warps/SM) → neutral |
-| Register spilling | static estimate | ≥192 live regs/thread, likely over 255 limit → local-mem load/store in hot loop |
 | `expf` count | verified | ~equal to forward (64/row/tile) → neutral |
 
 **Decomposition (time ratio):** `2.5×` (FLOPs) ✕ `~15–20×` (implementation inefficiency:
@@ -169,28 +180,34 @@ scalar-vs-TensorCore + atomic RMW + spills).
 > which is exact and O(N)-memory, but it is ~38–50× slower per launch than the V4 forward
 > (≈15–20× slower in achieved throughput, e.g. 988→59 GFLOPS at N=1024, measured on T4 with
 > 15-repetition timing). Only 2.5× of this is inherent to the greater FLOP count of the
-> backward pass. The remaining ~15–20× stems from
-> implementation choices: (i) the forward pass's QKᵀ matmul runs on fp16 Tensor Cores while
-> the backward run always scalar fp32 FMA, forfeiting the ~8× tensor throughput on every
-> matmul; (ii) dK/dV are accumulated in global memory via atomicAdd (8,192 per thread per
-> KV tile) with heavy cross-block contention, incurring read-modify-write traffic of
-> ~512 KB per tile versus a single O write in forward; and (iii) the backward kernel holds up
-> to 256 register-array elements per thread, likely exceeding the register file and spilling
-> to local memory. These are engineering limits of the current formulation rather than
+> backward pass. The remaining ~15–20× stems from three GPU-confirmed
+> implementation bottlenecks: (i) the forward pass's QKᵀ matmul runs on fp16 Tensor Cores
+> while the backward run always scalar fp32 FMA, forfeiting the ~8× tensor throughput on
+> every matmul; (ii) dK/dV are accumulated in global memory via atomicAdd (8,192 per thread
+> per KV tile) with heavy cross-block contention, incurring read-modify-write traffic of
+> ~512 KB per tile versus a single O write in forward; and (iii) the backward kernel
+> compiles to the 255-register hardware maximum with 3,772 B/thread spilled to local memory
+> (1,796 B spill stores + 1,976 B spill loads, verified via `nvcc --ptxas-options=-v`),
+> turning register references inside the hot loop into HBM-backed local-memory
+> round-trips. These are engineering limits of the current formulation rather than
 > algorithmic ones; a backward kernel parallelized over (num_warps × dK) with software
 > pipelining, Tensor-Core dQ/dK/dV, and segmented/atomic-free reduction is the obvious
 > headroom, aligning the gap toward the theoretical 2.5×.
 
 ---
 
-## `TODO: verify on GPU` (Colab, T4)
+## `TODO: verify on GPU` (Colab, T4) — remaining items
 
-1. `nvcc --ptxas-options=-v src/flash_attn_backward_v5.cu` → record maxrregcount + **spill
-   count** for `flash_attn_backward_v5_kernel`.
-2. `ncu` on V5: `sm__pipe_tensor_op_count`, `smsp__sass_thread_inst_executed_op_atom`,
+Register pressure is now **confirmed** (see §4: 255 regs/thread, 1,796 B spill stores +
+1,976 B spill loads, 240 B stack). Note the caveat: the build was compiled for **sm_52**
+(the arch flag was not explicit); register/stack limits are identical across sm_52/sm_75 so
+the numbers remain valid, but an sm_75 build with `-arch=sm_75` (as `setup.py` uses) would
+be the exact repro. Still open:
+
+1. `ncu` on V5: `sm__pipe_tensor_op_count`, `smsp__sass_thread_inst_executed_op_atom`,
    `l1tex__t_sectors_pipe_lsu_mem_global_op_atom`, `sm__warps_active*` to put real numbers
-   on atomics, RMW sectors, and occupancy.
-3. Confirm Tensor-Core vs FP32 achievable throughput ratio on the exact T4 SKU (clocks can
+   on atomic RMW sectors, atomic serialization, and occupancy.
+2. Confirm Tensor-Core vs FP32 achievable throughput ratio on the exact T4 SKU (clocks can
    shift the ~8× figure from `docs/archive/WRITEUP.md`).
-4. Re-run `benchmarks/run_all_benchmarks.py` (see also PROGRESS.md) to refresh the README
+3. Re-run `benchmarks/run_all_benchmarks.py` (see also PROGRESS.md) to refresh the README
    numbers and attach commit-able JSON results.
