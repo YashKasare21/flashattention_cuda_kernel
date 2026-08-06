@@ -69,8 +69,28 @@
 #include <torch/extension.h>
 #include <mma.h>
 #include <float.h>
+#include <stdio.h>
 
 using namespace nvcuda::wmma;
+
+// ---------------------------------------------------------------------------
+// DEBUG_TRACE — printf-based numerical tracing for V6 backward.
+//
+// HOW TO USE:
+//   1. Uncomment the #define below to enable tracing.
+//   2. Rebuild:  pip install -e .
+//   3. Run tests/debug_v6_trace.py FIRST to get Python reference values.
+//   4. Then run the kernel and compare [V6-TRACE] output against [V6-REF].
+//
+// The guard  (warp_id==0 && lane_id < 4)  prints exactly 4 lines per step
+// for the FIRST 4 columns of row 0 — enough to pinpoint which step diverges.
+//
+// IMPORTANT: call torch.cuda.synchronize() in Python after the kernel launch
+// to guarantee the printf buffer is flushed before reading output.
+//
+// REMOVE or comment out #define DEBUG_TRACE before committing.
+// ---------------------------------------------------------------------------
+// #define DEBUG_TRACE   // ← uncomment to enable printf tracing
 
 #define BLOCK_SIZE    64
 #define NUM_WARPS     4
@@ -303,6 +323,21 @@ void flash_attn_backward_v6_kernel(
         }
         __syncthreads();
 
+        // ── [TRACE POINT 1] S[0][0..3] ─────────────────────────────────────
+        // Printed BEFORE scale/mask so we can verify raw QK^T * scale value.
+        // s_Sp at this point holds S (fp16, post-scale via store_accum_half_smem).
+        // lane_id 0..3 own s_Sp[0][lane_id] (the first row, first 4 columns).
+        // Note: store_accum_half_smem writes warp*16 rows; warp 0, row 0, col 0
+        //       is written by lane 0 (local_row=0, local_col=0 for e=0) so
+        //       __half2float(s_Sp[0][lane_id]) gives S[row=0, col=lane_id].
+#ifdef DEBUG_TRACE
+        if (warp_id == 0 && lane_id < 4 && kv_tile == 0) {
+            // s_Sp[0][lane_id] = S[0, lane_id] in fp16
+            printf("[V6-TRACE] S[0][%d] (raw fp16, post-scale, pre-mask) = %.6f\n",
+                   lane_id, __half2float(s_Sp[0][lane_id]));
+        }
+#endif
+
         // ── 2) P = exp(S*scale - m)/l in-place, with causal mask ─────────
         // Only lanes 0..15 (row owners) touch their rows.
         if (lane_id < ROWS_PER_WARP && global_q_idx < N) {
@@ -314,6 +349,18 @@ void flash_attn_backward_v6_kernel(
             }
         }
         __syncthreads();
+
+        // ── [TRACE POINT 2] P[0][0..3] ─────────────────────────────────────
+        // s_Sp now holds P = exp(S*scale - m)/l with causal mask applied.
+        // For N=64, kv_tile=0, row 0: P[0][0] should equal 1.0 (only one
+        // unmasked position — j=0 — since causal: j<=i, and i=0 means j<=0).
+        // All P[0][j>0] should be 0.0 (masked out).
+#ifdef DEBUG_TRACE
+        if (warp_id == 0 && lane_id < 4 && kv_tile == 0) {
+            printf("[V6-TRACE] P[0][%d] (after softmax+causal_mask) = %.6f\n",
+                   lane_id, __half2float(s_Sp[0][lane_id]));
+        }
+#endif
 
         // ── 3) dP = dO_warp * V^T via WMMA → s_dP[warp*16..][0..64] ────
         {
@@ -339,6 +386,16 @@ void flash_attn_backward_v6_kernel(
         }
         __syncthreads();
 
+        // ── [TRACE POINT 3] dP[0][0..3] ─────────────────────────────────────
+        // s_dP now holds dP = dO @ V^T.
+        // Compare against Python: ref_dP[0, 0:4] from tests/ref_npy/dP.npy
+#ifdef DEBUG_TRACE
+        if (warp_id == 0 && lane_id < 4 && kv_tile == 0) {
+            printf("[V6-TRACE] dP[0][%d] (= dO @ V^T, pre-dS scaling) = %.6f\n",
+                   lane_id, __half2float(s_dP[0][lane_id]));
+        }
+#endif
+
         // ── 4) dS = P * (dP - D_i) * scale in-place into s_dP ───────────
         if (lane_id < ROWS_PER_WARP && global_q_idx < N) {
             #pragma unroll
@@ -349,6 +406,23 @@ void flash_attn_backward_v6_kernel(
             }
         }
         __syncthreads();
+
+        // ── [TRACE POINT 4] dS[0][0..3] ─────────────────────────────────────
+        // s_dP now holds dS = P * (dP - D_i) * scale.
+        // Compare against Python: ref_dS[0, 0:4] from tests/ref_npy/dS.npy
+        // Note: for row 0, D_i = sum(dO[0]*O[0]). If D_i is computed from the
+        // wrong O slice or wrong row, dS will be wrong even if P and dP are right.
+#ifdef DEBUG_TRACE
+        if (warp_id == 0 && lane_id < 4 && kv_tile == 0) {
+            printf("[V6-TRACE] dS[0][%d] (= P*(dP-D_i)*scale) = %.6f\n",
+                   lane_id, __half2float(s_dP[0][lane_id]));
+        }
+        // Also print D_i for row 0 (lane_id==0 only to avoid duplicates)
+        if (warp_id == 0 && lane_id == 0 && kv_tile == 0) {
+            printf("[V6-TRACE] D_i for row 0 = %.6f  (compare: tests/ref_npy/D_vec.npy[0])\n",
+                   D_i);  // D_i is only valid for lane_id < ROWS_PER_WARP; lane 0 owns row 0
+        }
+#endif
 
         // ── 5) dQ += dS_warp * K  (this warp's 16 i-rows × 4 d-tiles) ──
         // dS row_major [warp*16, 64) × K row_major [64, D_DIM) → dQ [16, D_DIM)
@@ -429,6 +503,35 @@ void flash_attn_backward_v6_kernel(
     // 8 KB s_Sp half array as float[64][64] would overflow it).
     {
         const int q_base = q_tile_idx * BLOCK_SIZE + warp_id * ROWS_PER_WARP;
+
+        // ── [TRACE POINT 5] partial dQ[0][0..3] from frag_dQ[0] ───────────
+        // SM75 accumulator layout for frag_dQ[0] (d-tile 0 → cols 0..15):
+        //   e=0: local_row = lane/4,    local_col = (lane%4)*2      → (0,0),(0,2),(0,4),(0,6)
+        //   e=1: local_row = lane/4,    local_col = (lane%4)*2 + 1  → (0,1),(0,3),(0,5),(0,7)
+        //
+        // For warp_id==0, q_base starts at row 0.
+        // lane_id==0: owns (row=0, col=0) at e=0 and (row=0, col=1) at e=1
+        // lane_id==1: owns (row=0, col=2) at e=0 and (row=0, col=3) at e=1
+        // So dQ_ref[0, 0:4] = { lane0.e0, lane0.e1, lane1.e0, lane1.e1 }
+        // We print e=0 for lanes 0..3 → cols 0, 2, 4, 6 (interleaved, see note).
+        //
+        // IMPORTANT: lane 0 e=0 → col 0, lane 0 e=1 → col 1, lane 1 e=0 → col 2.
+        // Printing e=0 for lanes 0..3 gives EVEN columns: 0, 2, 4, 6.
+        // Printing e=1 for lanes 0..3 gives ODD  columns: 1, 3, 5, 7.
+        // Compare against Python: np.load('tests/ref_npy/dQ_ref.npy')[0, 0::2]  (even)
+        //                     and np.load('tests/ref_npy/dQ_ref.npy')[0, 1::2]  (odd)
+#ifdef DEBUG_TRACE
+        if (warp_id == 0 && lane_id < 4) {
+            // e=0: even columns (0, 2, 4, 6)
+            const int col_even = (lane_id % 4) * 2;          // 0, 2, 4, 6
+            const int col_odd  = (lane_id % 4) * 2 + 1;      // 1, 3, 5, 7
+            printf("[V6-TRACE] dQ[0][col=%d] (frag_dQ[0], e=0, accumulated over all kv_tiles) = %.6f\n",
+                   col_even, frag_dQ[0].x[0]);
+            printf("[V6-TRACE] dQ[0][col=%d] (frag_dQ[0], e=1) = %.6f\n",
+                   col_odd, frag_dQ[0].x[1]);
+        }
+#endif
+
         #pragma unroll
         for (int dt = 0; dt < 4; ++dt) {
             store_accum_global(frag_dQ[dt], dQ_slice,
